@@ -1,15 +1,15 @@
 use actix_web::{get, App, HttpServer, Responder};
 use dotenv::dotenv;
+use futures::FutureExt;
+use log::{info, warn};
 use once_cell::sync::Lazy;
-use reqwest::{Client, Response, Error as ReqwestError};
+use reqwest::{Client, Error as ReqwestError, Response};
 use std::{
     env,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use tokio::{spawn, time};
-use log::{info, warn};
-use futures::FutureExt;
 
 // Shared state to hold the last-seen Instant
 static LAST_SEEN: Lazy<Arc<Mutex<Instant>>> = Lazy::new(|| {
@@ -31,10 +31,8 @@ async fn main() -> std::io::Result<()> {
     env_logger::init();
     dotenv().ok();
 
-    let pushover_token = env::var("PUSHOVER_TOKEN")
-        .expect("PUSHOVER_TOKEN must be set in .env");
-    let pushover_user = env::var("PUSHOVER_USER")
-        .expect("PUSHOVER_USER must be set in .env");
+    let pushover_token = env::var("PUSHOVER_TOKEN").expect("PUSHOVER_TOKEN must be set in .env");
+    let pushover_user = env::var("PUSHOVER_USER").expect("PUSHOVER_USER must be set in .env");
 
     let timeout_secs: u64 = env::var("HEARTBEAT_TIMEOUT_SECS")
         .unwrap_or_else(|_| "90".into())
@@ -78,14 +76,12 @@ async fn main() -> std::io::Result<()> {
                     .post("https://api.pushover.net/1/messages.json")
                     .form(&pushover_params)
                     .send()
-                    .inspect(|res: &Result<Response, ReqwestError>| {
-                        match res {
-                            Ok(r)  => {
-                                info!("Pushover status: {}", r.status());
-                                connection_missing = true;
-                            },
-                            Err(e) => warn!("Failed to send Pushover: {}", e),
+                    .inspect(|res: &Result<Response, ReqwestError>| match res {
+                        Ok(r) => {
+                            info!("Pushover status: {}", r.status());
+                            connection_missing = true;
                         }
+                        Err(e) => warn!("Failed to send Pushover: {}", e),
                     })
                     .await;
                 // Prevent repeat alerts until next heartbeat resets LAST_SEEN

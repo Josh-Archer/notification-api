@@ -1,0 +1,6 @@
+pre-push:
+  scripts:
+    bump_minor:
+      runner: bash
+      script: scripts/bump_minor.sh
+
