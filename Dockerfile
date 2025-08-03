@@ -8,7 +8,7 @@ WORKDIR /usr/src/app
 RUN apt-get update && apt-get install -y pkg-config libssl-dev build-essential ca-certificates
 
 # Copy manifests and dependencies
-COPY Cargo.toml Cargo.lock .env ./
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
 # Build release version
@@ -25,6 +25,9 @@ RUN apt-get update && apt-get install -y libssl3 ca-certificates && rm -rf /var/
 
 # Copy binary from builder
 COPY --from=builder /usr/src/app/target/release/notification-api .
+
+# Copy .env file
+COPY .env .
 
 # Expose port your app listens on
 EXPOSE 3000

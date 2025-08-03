@@ -1,9 +1,6 @@
 Push-Location "C:\Code\home\notification-api"
 
 # Build and tag Docker image
-docker build -t jarcher1200/notification-api:latest .
-
-# Push to Docker Hub
-docker push jarcher1200/notification-api:latest
+docker buildx build --platform linux/amd64,linux/arm64 -t jarcher1200/notification-api:latest --push .
 
 Pop-Location
