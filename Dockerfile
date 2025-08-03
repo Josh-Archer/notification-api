@@ -26,7 +26,11 @@ RUN apt-get update && apt-get install -y libssl3 ca-certificates && rm -rf /var/
 # Copy binary from builder
 COPY --from=builder /usr/src/app/target/release/notification-api .
 
-# Copy .env file
+# Set environment variables for secrets (to be injected at runtime)
+ENV PUSHOVER_TOKEN=""
+ENV PUSHOVER_USER=""
+
+# Copy .env file for non-sensitive config
 COPY .env .
 
 # Expose port your app listens on
