@@ -64,8 +64,59 @@ Now, every time you push, lefthook will bump the minor version and amend your co
   - Loads secrets from GitHub repository secrets
 
 ### Environment Variables
-- Sensitive values (e.g., `PUSHOVER_TOKEN`, `PUSHOVER_USER`) should be set as GitHub secrets or environment variables, not in `.env`.
+- Sensitive values (e.g., `PUSHOVER_TOKEN`, `PUSHOVER_USER`, `HEARTBEAT_AUTH_TOKEN`) should be set as GitHub secrets or environment variables, not in `.env`.
 - Non-sensitive config (e.g., timeouts) can be set in `.env`.
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `PUSHOVER_TOKEN` | yes | — | Pushover application token |
+| `PUSHOVER_USER` | yes | — | Pushover user/group key |
+| `HEARTBEAT_TIMEOUT_SECS` | no | `90` | Seconds without heartbeat before alerting |
+| `CHECK_INTERVAL_SECS` | no | `10` | How often to check staleness |
+| `DEBOUNCE_SECS` | no | `300` | Wait after an alert before checking again |
+| `HEARTBEAT_AUTH_TOKEN` | recommended | unset | Shared secret for `/heartbeat/*` (see Security) |
+
+## Security
+
+The `/heartbeat/poop` endpoint updates the in-memory last-seen timestamp. Anyone who can call it can suppress outage detection. Protect it.
+
+### Application shared-secret auth (recommended)
+
+Set `HEARTBEAT_AUTH_TOKEN` to a long random secret. When this variable is set (non-empty), the service **fails closed**: heartbeat requests without a matching secret receive `401 Unauthorized`.
+
+Clients may send the secret in either header:
+
+```http
+X-Heartbeat-Token: <HEARTBEAT_AUTH_TOKEN>
+```
+
+or:
+
+```http
+Authorization: Bearer <HEARTBEAT_AUTH_TOKEN>
+```
+
+Example:
+
+```bash
+curl -H "X-Heartbeat-Token: $HEARTBEAT_AUTH_TOKEN" http://localhost:3000/heartbeat/poop
+```
+
+If `HEARTBEAT_AUTH_TOKEN` is **not** set, the endpoint remains open and the process logs a warning at startup. Use that mode only when network controls below fully isolate the port.
+
+### Network policy / mTLS (defense in depth)
+
+Even with app auth, prefer restricting who can reach port `3000`:
+
+- **Host firewall / security groups**: allow only the devices that send heartbeats (and operators/metrics scrapers if needed).
+- **Kubernetes NetworkPolicy** (or equivalent): ingress only from the monitoring / device namespaces.
+- **mTLS / service mesh**: terminate client certificates at the mesh or reverse proxy so only trusted clients can connect; app auth remains an optional second factor.
+- **Private network / VPN**: do not expose the service on the public internet.
+
+### Operational notes
+
+- Rotate `HEARTBEAT_AUTH_TOKEN` by updating the secret and redeploying clients and the API together.
+- Do not commit secrets; inject them via the orchestrator, Docker secrets, or GitHub Actions repository secrets.
 
 ## Contributing
 Pull requests are welcome! For major changes, please open an issue first to discuss what you would like to change.
