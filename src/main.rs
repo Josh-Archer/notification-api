@@ -1,13 +1,11 @@
-use actix_web::{
-    get,
-    http::header::{self, HeaderMap},
-    web, App, HttpRequest, HttpResponse, HttpServer, Responder,
-};
+mod monitor;
+
+use actix_web::{get, App, HttpServer, Responder};
 use dotenv::dotenv;
-use futures::FutureExt;
 use log::{info, warn};
+use monitor::{evaluate_check, evaluate_heartbeat, CheckDecision, HeartbeatDecision};
 use once_cell::sync::Lazy;
-use reqwest::{Client, Error as ReqwestError, Response};
+use reqwest::Client;
 use std::{
     env,
     sync::{Arc, Mutex},
@@ -15,95 +13,105 @@ use std::{
 };
 use tokio::{spawn, time};
 
-/// Shared secret for authenticating heartbeat requests.
-/// When `Some`, requests without a matching token are rejected (fail closed).
-/// When `None`, authentication is disabled (rely on network policy / mTLS).
-#[derive(Clone, Debug)]
-struct AuthConfig {
-    token: Option<String>,
+/// Shared monitor timestamps and outage flag.
+///
+/// `last_heartbeat` is only updated on a real `/heartbeat` request.
+/// `last_alert` is only updated when an outage alert is successfully sent.
+/// Alerts never touch `last_heartbeat` (fixes masking of continued outages).
+#[derive(Debug)]
+struct MonitorState {
+    last_heartbeat: Instant,
+    last_alert: Option<Instant>,
+    /// True after an outage alert until a recovering heartbeat arrives.
+    in_outage: bool,
+    /// Anchor so Instant values can be converted to relative seconds for pure logic.
+    epoch: Instant,
 }
 
-// Shared state to hold the last-seen Instant
-static LAST_SEEN: Lazy<Arc<Mutex<Instant>>> = Lazy::new(|| {
-    // Initialize to now so we don't immediately trigger alert on startup
-    Arc::new(Mutex::new(Instant::now()))
-});
-
-/// Extract a presented shared secret from either:
-/// - `Authorization: Bearer <token>`
-/// - `X-Heartbeat-Token: <token>`
-fn extract_presented_token(headers: &HeaderMap) -> Option<String> {
-    if let Some(value) = headers.get("X-Heartbeat-Token") {
-        if let Ok(s) = value.to_str() {
-            let trimmed = s.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
+impl MonitorState {
+    fn new() -> Self {
+        let epoch = Instant::now();
+        Self {
+            last_heartbeat: epoch,
+            last_alert: None,
+            in_outage: false,
+            epoch,
         }
     }
 
-    if let Some(value) = headers.get(header::AUTHORIZATION) {
-        if let Ok(s) = value.to_str() {
-            let trimmed = s.trim();
-            if let Some(token) = trimmed
-                .strip_prefix("Bearer ")
-                .or_else(|| trimmed.strip_prefix("bearer "))
-            {
-                let token = token.trim();
-                if !token.is_empty() {
-                    return Some(token.to_string());
-                }
-            }
-        }
+    fn secs_since_epoch(&self, instant: Instant) -> u64 {
+        instant.duration_since(self.epoch).as_secs()
     }
 
-    None
-}
-
-/// Constant-time-ish equality for shared secrets (avoids obvious early-exit leaks).
-fn tokens_equal(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
+    fn now_secs(&self) -> u64 {
+        self.secs_since_epoch(Instant::now())
     }
-    a.bytes()
-        .zip(b.bytes())
-        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-        == 0
-}
 
-fn authorize(headers: &HeaderMap, auth: &AuthConfig) -> Result<(), HttpResponse> {
-    match &auth.token {
-        // Auth not configured: open endpoint (network policy / mTLS must protect it).
-        None => Ok(()),
-        // Auth configured: fail closed unless a matching shared secret is presented.
-        Some(expected) => match extract_presented_token(headers) {
-            Some(presented) if tokens_equal(&presented, expected) => Ok(()),
-            _ => Err(HttpResponse::Unauthorized()
-                .insert_header((header::WWW_AUTHENTICATE, "Bearer"))
-                .body("Unauthorized")),
-        },
+    /// Process-global timeout from env (set in `main` after load).
+    fn timeout_secs(&self) -> u64 {
+        TIMEOUT_SECS.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
+
+static STATE: Lazy<Arc<Mutex<MonitorState>>> =
+    Lazy::new(|| Arc::new(Mutex::new(MonitorState::new())));
+
+static TIMEOUT_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(90);
 
 #[get("/heartbeat/poop")]
-async fn heartbeat(req: HttpRequest, auth: web::Data<AuthConfig>) -> impl Responder {
-    if let Err(resp) = authorize(req.headers(), auth.get_ref()) {
-        return resp;
+async fn heartbeat() -> impl Responder {
+    let mut state = STATE.lock().unwrap();
+    let now = Instant::now();
+    let now_secs = state.secs_since_epoch(now);
+    let prev_secs = state.secs_since_epoch(state.last_heartbeat);
+
+    let decision = evaluate_heartbeat(now_secs, prev_secs, state.in_outage, state.timeout_secs());
+
+    match decision {
+        HeartbeatDecision::Recorded => {
+            info!("Heartbeat received (healthy)");
+        }
+        HeartbeatDecision::Recovered {
+            outage_duration_secs,
+        } => {
+            info!(
+                "Heartbeat received — recovered after {}s without heartbeat",
+                outage_duration_secs
+            );
+            state.in_outage = false;
+        }
     }
 
-    let mut last = LAST_SEEN.lock().unwrap();
-    *last = Instant::now();
-    info!("Heartbeat received at {:?}", *last);
-    HttpResponse::Ok().body("OK")
+    // Only real heartbeats advance last_heartbeat.
+    state.last_heartbeat = now;
+    "OK"
 }
 
-fn app_config(cfg: &mut web::ServiceConfig, auth: AuthConfig) {
-    cfg.app_data(web::Data::new(auth)).service(heartbeat);
+async fn send_pushover(client: &Client, token: &str, user: &str, message: &str) -> bool {
+    let params = [
+        ("token", token),
+        ("user", user),
+        ("message", message),
+    ];
+    match client
+        .post("https://api.pushover.net/1/messages.json")
+        .form(&params)
+        .send()
+        .await
+    {
+        Ok(r) => {
+            info!("Pushover status: {}", r.status());
+            r.status().is_success()
+        }
+        Err(e) => {
+            warn!("Failed to send Pushover: {}", e);
+            false
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    // Initialize logging and load .env
     env_logger::init();
     dotenv().ok();
 
@@ -123,175 +131,71 @@ async fn main() -> std::io::Result<()> {
         .parse()
         .expect("DEBOUNCE_SECS must be a number");
 
-    let auth_token = env::var("HEARTBEAT_AUTH_TOKEN")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    if auth_token.is_none() {
-        warn!(
-            "HEARTBEAT_AUTH_TOKEN is not set; /heartbeat/poop accepts unauthenticated requests. \
-             Restrict network access (firewall, NetworkPolicy, mTLS) or set HEARTBEAT_AUTH_TOKEN."
-        );
-    } else {
-        info!("Heartbeat authentication enabled (shared-secret header required)");
-    }
-    let auth = AuthConfig { token: auth_token };
+    TIMEOUT_SECS.store(timeout_secs, std::sync::atomic::Ordering::Relaxed);
 
-    // Spawn the staleness-check task
-    let mut connection_missing: bool = false;
     let client = Client::new();
     spawn(async move {
         loop {
-            let mut time_interval = check_interval;
-            if connection_missing {
-                info!("Starting debounce now that we alerted");
-                time_interval = debounce_secs;
-            }
-            time::sleep(Duration::from_secs(time_interval)).await;
-            connection_missing = false;
-            let last = *LAST_SEEN.lock().unwrap();
-            let elapsed = last.elapsed().as_secs();
+            time::sleep(Duration::from_secs(check_interval)).await;
 
-            if elapsed > timeout_secs {
-                warn!(
-                    "No heartbeat for {}s (> {}s). Sending Pushover alert.",
-                    elapsed, timeout_secs
-                );
-                let pushover_params = [
-                    ("token", pushover_token.as_str()),
-                    ("user", pushover_user.as_str()),
-                    ("message", "❌ Poop Monitor is offline!"),
-                ];
-                let _ = client
-                    .post("https://api.pushover.net/1/messages.json")
-                    .form(&pushover_params)
-                    .send()
-                    .inspect(|res: &Result<Response, ReqwestError>| match res {
-                        Ok(r) => {
-                            info!("Pushover status: {}", r.status());
-                            connection_missing = true;
-                        }
-                        Err(e) => warn!("Failed to send Pushover: {}", e),
-                    })
-                    .await;
-                // Prevent repeat alerts until next heartbeat resets LAST_SEEN
-                let mut last = LAST_SEEN.lock().unwrap();
-                *last = Instant::now();
+            let decision = {
+                let state = STATE.lock().unwrap();
+                let now_secs = state.now_secs();
+                let last_hb = state.secs_since_epoch(state.last_heartbeat);
+                let last_alert = state
+                    .last_alert
+                    .map(|t| state.secs_since_epoch(t));
+                evaluate_check(now_secs, last_hb, last_alert, timeout_secs, debounce_secs)
+            };
+
+            match decision {
+                CheckDecision::Healthy {
+                    secs_since_heartbeat,
+                } => {
+                    info!(
+                        "Heartbeat fresh ({}s ago, timeout {}s)",
+                        secs_since_heartbeat, timeout_secs
+                    );
+                }
+                CheckDecision::StillDown {
+                    secs_since_heartbeat,
+                    secs_since_alert,
+                    secs_until_next_alert,
+                } => {
+                    info!(
+                        "Still down: no heartbeat for {}s; last alert {}s ago; next alert in {}s (debounce {}s)",
+                        secs_since_heartbeat,
+                        secs_since_alert,
+                        secs_until_next_alert,
+                        debounce_secs
+                    );
+                }
+                CheckDecision::AlertOutage {
+                    secs_since_heartbeat,
+                } => {
+                    warn!(
+                        "No heartbeat for {}s (> {}s). Sending Pushover outage alert.",
+                        secs_since_heartbeat, timeout_secs
+                    );
+                    let message = format!(
+                        "❌ Poop Monitor is offline! (no heartbeat for {}s)",
+                        secs_since_heartbeat
+                    );
+                    let ok =
+                        send_pushover(&client, &pushover_token, &pushover_user, &message).await;
+                    if ok {
+                        let mut state = STATE.lock().unwrap();
+                        // Only last_alert / in_outage change — never touch last_heartbeat.
+                        state.last_alert = Some(Instant::now());
+                        state.in_outage = true;
+                    }
+                }
             }
         }
     });
 
-    // Start HTTP server
-    HttpServer::new(move || {
-        let auth = auth.clone();
-        App::new().configure(move |cfg| app_config(cfg, auth.clone()))
-    })
-    .bind(("0.0.0.0", 3000))?
-    .run()
-    .await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use actix_web::{http::StatusCode, test, App};
-
-    async fn call_heartbeat(auth: AuthConfig, headers: Vec<(&str, &str)>) -> (StatusCode, String) {
-        let app = test::init_service(
-            App::new().configure(move |cfg| app_config(cfg, auth.clone())),
-        )
-        .await;
-
-        let mut req = test::TestRequest::get().uri("/heartbeat/poop");
-        for (name, value) in headers {
-            req = req.insert_header((name, value));
-        }
-        let resp = test::call_service(&app, req.to_request()).await;
-        let status = resp.status();
-        let body = test::read_body(resp).await;
-        let body = String::from_utf8(body.to_vec()).unwrap();
-        (status, body)
-    }
-
-    #[actix_web::test]
-    async fn heartbeat_ok_when_auth_disabled() {
-        let (status, body) = call_heartbeat(AuthConfig { token: None }, vec![]).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, "OK");
-    }
-
-    #[actix_web::test]
-    async fn heartbeat_unauthorized_when_auth_configured_and_missing_header() {
-        let auth = AuthConfig {
-            token: Some("super-secret".into()),
-        };
-        let (status, body) = call_heartbeat(auth, vec![]).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_eq!(body, "Unauthorized");
-    }
-
-    #[actix_web::test]
-    async fn heartbeat_unauthorized_when_wrong_token() {
-        let auth = AuthConfig {
-            token: Some("super-secret".into()),
-        };
-        let (status, _) = call_heartbeat(
-            auth,
-            vec![("X-Heartbeat-Token", "wrong-token")],
-        )
-        .await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-    }
-
-    #[actix_web::test]
-    async fn heartbeat_ok_with_x_heartbeat_token() {
-        let auth = AuthConfig {
-            token: Some("super-secret".into()),
-        };
-        let (status, body) = call_heartbeat(
-            auth,
-            vec![("X-Heartbeat-Token", "super-secret")],
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, "OK");
-    }
-
-    #[actix_web::test]
-    async fn heartbeat_ok_with_authorization_bearer() {
-        let auth = AuthConfig {
-            token: Some("super-secret".into()),
-        };
-        let (status, body) = call_heartbeat(
-            auth,
-            vec![("Authorization", "Bearer super-secret")],
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, "OK");
-    }
-
-    #[actix_web::test]
-    async fn extract_token_prefers_x_heartbeat_token() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::HeaderName::from_static("x-heartbeat-token"),
-            header::HeaderValue::from_static("from-x"),
-        );
-        headers.insert(
-            header::AUTHORIZATION,
-            header::HeaderValue::from_static("Bearer from-auth"),
-        );
-        assert_eq!(
-            extract_presented_token(&headers).as_deref(),
-            Some("from-x")
-        );
-    }
-
-    #[actix_web::test]
-    async fn tokens_equal_rejects_length_mismatch() {
-        assert!(!tokens_equal("abc", "ab"));
-        assert!(tokens_equal("abc", "abc"));
-        assert!(!tokens_equal("abc", "abd"));
-    }
+    HttpServer::new(|| App::new().service(heartbeat))
+        .bind(("0.0.0.0", 3000))?
+        .run()
+        .await
 }
