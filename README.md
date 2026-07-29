@@ -4,12 +4,22 @@ A Rust-based notification API with Docker deployment and automated versioning.
 
 ## Features
 - Written in Rust using Actix Web
-- Multi-device heartbeat monitoring via `/heartbeat/{device_id}`
-- Per-device last-seen tracking and optional per-device timeouts
-- Sends notifications via Pushover when a device goes silent
+- Sends notifications via Pushover
+- Heartbeat watcher with **outage** and **recovery** alerts
 - Automated Docker builds and publishing via GitHub Actions
 - Versioning is managed automatically (minor version bump on push)
 - Uses [lefthook](https://github.com/evilmartians/lefthook) for Git hooks
+
+## Heartbeat outage & recovery
+
+The service exposes `GET /heartbeat/poop`. A background task watches the last heartbeat time:
+
+| Event | Condition | Notification |
+|-------|-----------|--------------|
+| **Outage** | No heartbeat for longer than `HEARTBEAT_TIMEOUT_SECS` | `OUTAGE_MESSAGE` |
+| **Recovery** | First heartbeat after an outage alert was sent | `RECOVERY_MESSAGE` |
+
+Recovery fires **only** after a prior outage alert (not on ordinary heartbeats or startup). While still offline, outage alerts may repeat after `DEBOUNCE_SECS`.
 
 ## Getting Started
 
@@ -31,46 +41,6 @@ A Rust-based notification API with Docker deployment and automated versioning.
    cargo build --release
    cargo run
    ```
-4. Run tests:
-   ```bash
-   cargo test
-   ```
-
-### Heartbeat API
-
-Devices should periodically hit the heartbeat endpoint so the API can detect outages.
-
-```http
-GET /heartbeat/{device_id}
-```
-
-- `{device_id}`: 1–64 characters; ascii letters, digits, `_`, or `-`
-- **200 OK** (`OK`) — device is configured and last-seen was updated
-- **400 Bad Request** — invalid device id
-- **404 Not Found** — device is not listed in `HEARTBEAT_DEVICES`
-
-#### Example
-
-Configure two devices in `.env`:
-
-```env
-HEARTBEAT_DEVICES=poop:90,fridge:120
-HEARTBEAT_TIMEOUT_SECS=90
-CHECK_INTERVAL_SECS=10
-DEBOUNCE_SECS=300
-```
-
-From each device (cron, script, or agent):
-
-```bash
-# every minute from the "poop" monitor
-curl -fsS http://notification-api:3000/heartbeat/poop
-
-# fridge uses a longer 120s timeout
-curl -fsS http://notification-api:3000/heartbeat/fridge
-```
-
-If `poop` stops checking in for more than 90s (or `fridge` for more than 120s), the service sends a Pushover alert naming the offline device.
 
 ### Docker
 Build and run the Docker container:
@@ -107,20 +77,23 @@ Now, every time you push, lefthook will bump the minor version and amend your co
 
 ### Environment Variables
 - Sensitive values (e.g., `PUSHOVER_TOKEN`, `PUSHOVER_USER`) should be set as GitHub secrets or environment variables, not in `.env`.
-- Non-sensitive config (timeouts, device list) can be set in `.env` (see `.env.example`).
+- Non-sensitive config (e.g., timeouts) can be set in `.env`.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PUSHOVER_TOKEN` | _(required)_ | Pushover application token |
-| `PUSHOVER_USER` | _(required)_ | Pushover user/group key |
-| `HEARTBEAT_TIMEOUT_SECS` | `90` | Default silence timeout (seconds) |
-| `CHECK_INTERVAL_SECS` | `10` | How often to scan devices |
-| `DEBOUNCE_SECS` | `300` | Wait after an alert before the next check cycle |
-| `HEARTBEAT_DEVICES` | `poop` | Comma-separated `device_id[:timeout]` list |
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `PUSHOVER_TOKEN` | yes | — | Pushover application token |
+| `PUSHOVER_USER` | yes | — | Pushover user/group key |
+| `HEARTBEAT_TIMEOUT_SECS` | no | `90` | Seconds without a heartbeat before outage alert |
+| `CHECK_INTERVAL_SECS` | no | `10` | How often to check staleness while healthy |
+| `DEBOUNCE_SECS` | no | `300` | Wait between repeat outage alerts |
+| `OUTAGE_MESSAGE` | no | `❌ Poop Monitor is offline!` | Pushover text for outage |
+| `RECOVERY_MESSAGE` | no | `✅ Poop Monitor is back online!` | Pushover text when heartbeats resume after outage |
 
-`HEARTBEAT_DEVICES` examples:
-- `poop` — one device, default timeout
-- `poop:90,fridge:120,server` — per-device timeouts; `server` uses `HEARTBEAT_TIMEOUT_SECS`
+### Tests
+```bash
+cargo test
+```
+Unit tests cover the outage/recovery state machine (recovery only after a prior outage alert).
 
 ## Contributing
 Pull requests are welcome! For major changes, please open an issue first to discuss what you would like to change.
