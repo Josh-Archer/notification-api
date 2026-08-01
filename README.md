@@ -69,11 +69,14 @@ This project uses [lefthook](https://github.com/evilmartians/lefthook) to automa
 Now, every time you push, lefthook will bump the minor version and amend your commit.
 
 ### GitHub Actions
-- On every push to `main`, the workflow:
-  - Builds the Rust app
-  - Tags the commit with the current version
-  - Builds and pushes Docker images tagged with the version and `latest`
-  - Loads secrets from GitHub repository secrets
+- On every push to `main` (and via `workflow_dispatch`), the workflow:
+  - Tags the commit with the current Cargo.toml version (if missing)
+  - Builds a multi-arch image (`linux/amd64`, `linux/arm64`)
+  - Always pushes to GHCR: `ghcr.io/josh-archer/notification-api:{version,latest}`
+  - Also pushes to Docker Hub when `DOCKER_USERNAME` / `DOCKER_PASSWORD` are valid
+- Required secrets:
+  - `PUSHOVER_TOKEN`, `PUSHOVER_USER` (app runtime/config used by CI env)
+  - Optional: `DOCKER_USERNAME`, `DOCKER_PASSWORD` — use a Docker Hub **Access Token** (Read & Write) as the password. Account passwords are rejected and will skip Docker Hub without failing the GHCR publish.
 
 ### Environment Variables
 - Sensitive values (e.g., `PUSHOVER_TOKEN`, `PUSHOVER_USER`) should be set as GitHub secrets or environment variables, not in `.env`.
