@@ -4,10 +4,52 @@ A Rust-based notification API with Docker deployment and automated versioning.
 
 ## Features
 - Written in Rust using Actix Web
+- Heartbeat watcher with clear still-down vs recovered semantics
 - Sends notifications via Pushover
 - Automated Docker builds and publishing via GitHub Actions
 - Versioning is managed automatically (minor version bump on push to `main`)
 - Uses [lefthook](https://github.com/evilmartians/lefthook) for Git hooks
+
+## Heartbeat monitoring
+
+The service exposes `GET /heartbeat/poop`. A background task checks whether heartbeats are still arriving.
+
+### Timestamps (important)
+
+| Field | Updated when | Purpose |
+|--------|----------------|---------|
+| **last_heartbeat** | Only on a real heartbeat HTTP request | Source of truth for “how long has the monitor been silent?” |
+| **last_alert** | Only when an outage Pushover alert is sent successfully | Enforces **debounce** between repeat outage alerts |
+
+**Alerts never reset `last_heartbeat`.** Resetting “last seen” after an alert used to make continued outages look shorter than they were and could interact badly with timeout/debounce (see issue #4).
+
+### Semantics
+
+| Situation | Behavior |
+|-----------|----------|
+| Heartbeat age ≤ `HEARTBEAT_TIMEOUT_SECS` | **Healthy** — no alert |
+| Heartbeat age > timeout, and no alert yet (or debounce elapsed) | **Alert outage** — send Pushover; set `last_alert`, mark `in_outage` |
+| Heartbeat age > timeout, but still inside debounce after `last_alert` | **Still down** — log only; do not re-alert yet |
+| Heartbeat arrives while `in_outage` (or after timeout already exceeded) | **Recovered** — clear outage flag; `last_heartbeat` advances |
+
+Checks run every `CHECK_INTERVAL_SECS`. Debounce is applied via `last_alert`, not by faking a heartbeat.
+
+### Environment variables (monitoring)
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `HEARTBEAT_TIMEOUT_SECS` | `90` | Seconds without a heartbeat before the service is considered down |
+| `CHECK_INTERVAL_SECS` | `10` | How often the background checker runs |
+| `DEBOUNCE_SECS` | `300` | Minimum seconds between successive outage alerts while still down |
+| `PUSHOVER_TOKEN` / `PUSHOVER_USER` | (required) | Pushover credentials |
+
+### Tests
+
+Pure timeout/debounce evaluation lives in `src/monitor.rs` and is covered by unit tests:
+
+```bash
+cargo test
+```
 
 ## Getting Started
 
