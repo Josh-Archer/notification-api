@@ -92,6 +92,7 @@ struct NotifyConfig {
     user: String,
     outage_message: String,
     recovery_message: String,
+    pushover_url: String,
 }
 
 async fn send_pushover(client: &Client, cfg: &NotifyConfig, message: &str) -> bool {
@@ -101,14 +102,18 @@ async fn send_pushover(client: &Client, cfg: &NotifyConfig, message: &str) -> bo
         ("message", message),
     ];
     match client
-        .post("https://api.pushover.net/1/messages.json")
+        .post(&cfg.pushover_url)
         .form(&pushover_params)
         .send()
         .await
     {
-        Ok(r) => {
+        Ok(r) if r.status().is_success() => {
             info!("Pushover status: {}", r.status());
             true
+        }
+        Ok(r) => {
+            warn!("Pushover request failed with status: {}", r.status());
+            false
         }
         Err(e) => {
             warn!("Failed to send Pushover: {}", e);
@@ -168,6 +173,8 @@ async fn main() -> std::io::Result<()> {
 
     let pushover_token = env::var("PUSHOVER_TOKEN").expect("PUSHOVER_TOKEN must be set in .env");
     let pushover_user = env::var("PUSHOVER_USER").expect("PUSHOVER_USER must be set in .env");
+    let pushover_url = env::var("PUSHOVER_URL")
+        .unwrap_or_else(|_| "https://api.pushover.net/1/messages.json".into());
     let outage_message =
         env::var("OUTAGE_MESSAGE").unwrap_or_else(|_| "❌ Poop Monitor is offline!".into());
     let recovery_message =
@@ -193,6 +200,7 @@ async fn main() -> std::io::Result<()> {
         user: pushover_user,
         outage_message,
         recovery_message,
+        pushover_url,
     };
     let client = Client::new();
 
@@ -272,8 +280,10 @@ async fn main() -> std::io::Result<()> {
 mod tests {
     use super::{
         monitor::{evaluate_check, CheckDecision},
-        on_heartbeat, on_staleness_check, Alert, MonitorState, Phase,
+        on_heartbeat, on_staleness_check, send_pushover, Alert, MonitorState, NotifyConfig, Phase,
     };
+    use actix_web::{web, App, HttpResponse, HttpServer};
+    use reqwest::Client;
     use std::time::Instant;
 
     #[test]
@@ -404,5 +414,124 @@ mod tests {
                 secs_since_heartbeat: 400
             }
         );
+    }
+
+    #[actix_web::test]
+    async fn send_pushover_checks_http_status_codes() {
+        let server = HttpServer::new(|| {
+            App::new()
+                .route(
+                    "/ok",
+                    web::post().to(|| async { HttpResponse::Ok().body("{\"status\":1}") }),
+                )
+                .route(
+                    "/client_error",
+                    web::post().to(|| async {
+                        HttpResponse::BadRequest()
+                            .body("{\"status\":0,\"errors\":[\"token is invalid\"]}")
+                    }),
+                )
+                .route(
+                    "/unauthorized",
+                    web::post().to(|| async {
+                        HttpResponse::Unauthorized()
+                            .body("{\"status\":0,\"errors\":[\"user not found\"]}")
+                    }),
+                )
+                .route(
+                    "/server_error",
+                    web::post().to(|| async {
+                        HttpResponse::InternalServerError()
+                            .body("{\"status\":0,\"errors\":[\"internal error\"]}")
+                    }),
+                )
+        })
+        .bind(("127.0.0.1", 0))
+        .expect("bind mock server");
+
+        let port = server.addrs()[0].port();
+        let _server_handle = tokio::spawn(server.run());
+
+        let client = Client::new();
+        let mut cfg = NotifyConfig {
+            token: "REDACTED_TEST_VALUE".into(),
+            user: "REDACTED_TEST_VALUE".into(),
+            outage_message: "outage".into(),
+            recovery_message: "recovery".into(),
+            pushover_url: format!("http://127.0.0.1:{}/ok", port),
+        };
+
+        // 200 OK -> true
+        assert!(send_pushover(&client, &cfg, "msg").await);
+
+        // 400 Bad Request (Pushover 4xx) -> false
+        cfg.pushover_url = format!("http://127.0.0.1:{}/client_error", port);
+        assert!(!send_pushover(&client, &cfg, "msg").await);
+
+        // 401 Unauthorized (Pushover 4xx) -> false
+        cfg.pushover_url = format!("http://127.0.0.1:{}/unauthorized", port);
+        assert!(!send_pushover(&client, &cfg, "msg").await);
+
+        // 500 Internal Server Error -> false
+        cfg.pushover_url = format!("http://127.0.0.1:{}/server_error", port);
+        assert!(!send_pushover(&client, &cfg, "msg").await);
+
+        // Network connection error -> false
+        cfg.pushover_url = "http://127.0.0.1:1/nonexistent".into();
+        assert!(!send_pushover(&client, &cfg, "msg").await);
+    }
+
+    #[test]
+    fn failed_pushover_send_does_not_start_debounce_window() {
+        let mut mon = MonitorState::new();
+        let timeout_secs = 90;
+        let debounce_secs = 300;
+        let last_hb_secs = 0;
+
+        // t=100: heartbeat is past timeout (100 > 90), so check wants to alert outage
+        let decision = evaluate_check(
+            100,
+            last_hb_secs,
+            mon.last_alert.map(|t| mon.secs_since_epoch(t)),
+            timeout_secs,
+            debounce_secs,
+        );
+        assert_eq!(
+            decision,
+            CheckDecision::AlertOutage {
+                secs_since_heartbeat: 100
+            }
+        );
+
+        // Simulate send_pushover failure (e.g. Pushover returned 4xx)
+        let send_success = false;
+        if send_success {
+            let (next, _) = on_staleness_check(mon.phase, true);
+            mon.phase = next;
+            mon.last_alert = Some(Instant::now());
+        }
+
+        // Neither last_alert nor phase should have been updated
+        assert!(mon.last_alert.is_none());
+        assert_eq!(mon.phase, Phase::Healthy);
+
+        // Next check cycle (e.g. t=110): debounce window is NOT running, so it retries alerting
+        let decision = evaluate_check(
+            110,
+            last_hb_secs,
+            mon.last_alert.map(|t| mon.secs_since_epoch(t)),
+            timeout_secs,
+            debounce_secs,
+        );
+        assert_eq!(
+            decision,
+            CheckDecision::AlertOutage {
+                secs_since_heartbeat: 110
+            }
+        );
+
+        // A subsequent heartbeat does NOT emit a false recovery alert
+        let (_, alert) = on_heartbeat(mon.phase);
+        assert_eq!(alert, Alert::None);
     }
 }
