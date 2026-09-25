@@ -8,9 +8,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckDecision {
     /// Last heartbeat is within the timeout window.
-    Healthy {
-        secs_since_heartbeat: u64,
-    },
+    Healthy { secs_since_heartbeat: u64 },
     /// Past timeout, but still inside the post-alert debounce window — do not re-alert.
     StillDown {
         secs_since_heartbeat: u64,
@@ -18,9 +16,7 @@ pub enum CheckDecision {
         secs_until_next_alert: u64,
     },
     /// Past timeout and debounce allows another outage alert.
-    AlertOutage {
-        secs_since_heartbeat: u64,
-    },
+    AlertOutage { secs_since_heartbeat: u64 },
 }
 
 /// Decision produced when a heartbeat is received.
@@ -29,9 +25,7 @@ pub enum HeartbeatDecision {
     /// Heartbeat while the monitor considers the service healthy.
     Recorded,
     /// Heartbeat after an outage (alert was sent and/or timeout already exceeded).
-    Recovered {
-        outage_duration_secs: u64,
-    },
+    Recovered { outage_duration_secs: u64 },
 }
 
 /// Evaluate whether to alert, stay silent (still down / debouncing), or treat as healthy.
@@ -193,7 +187,13 @@ mod tests {
         let last_heartbeat = 0_u64;
         let first_alert_at = 100_u64;
         let after_debounce = first_alert_at + 300; // 400
-        let d = evaluate_check(after_debounce, last_heartbeat, Some(first_alert_at), 90, 300);
+        let d = evaluate_check(
+            after_debounce,
+            last_heartbeat,
+            Some(first_alert_at),
+            90,
+            300,
+        );
         match d {
             CheckDecision::AlertOutage {
                 secs_since_heartbeat,

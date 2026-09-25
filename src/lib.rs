@@ -332,8 +332,11 @@ mod tests {
         assert!(empty.backend_names().is_empty());
     }
 
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn notify_config_from_env_pushover_and_ntfy() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         // Safety: tests that touch env should run single-threaded for these keys.
         // We only set when missing side effects matter — use a dedicated approach.
         std::env::set_var("PUSHOVER_TOKEN", "tok");
@@ -358,6 +361,7 @@ mod tests {
 
     #[test]
     fn notify_config_from_env_ntfy_only() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         std::env::remove_var("PUSHOVER_TOKEN");
         std::env::remove_var("PUSHOVER_USER");
         std::env::set_var("NTFY_TOPIC", "solo");
@@ -375,6 +379,7 @@ mod tests {
 
     #[test]
     fn notify_config_from_env_rejects_empty() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         std::env::remove_var("PUSHOVER_TOKEN");
         std::env::remove_var("PUSHOVER_USER");
         std::env::remove_var("NTFY_TOPIC");
