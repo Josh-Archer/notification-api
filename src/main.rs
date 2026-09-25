@@ -1,11 +1,17 @@
+mod monitor;
+
 use actix_web::{get, web, App, HttpServer, Responder};
 use dotenv::dotenv;
 use log::{info, warn};
+use monitor::{evaluate_check, evaluate_heartbeat, CheckDecision, HeartbeatDecision};
 use once_cell::sync::Lazy;
 use reqwest::Client;
 use std::{
     env,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 use tokio::{spawn, time};
@@ -48,7 +54,8 @@ fn on_staleness_check(phase: Phase, is_stale: bool) -> (Phase, Alert) {
 /// Only moves phase to Outage when sending the alert succeeds.
 fn on_outage_alert_result(phase: Phase, send_succeeded: bool) -> Phase {
     if send_succeeded {
-        Phase::Outage
+        let (next, _) = on_staleness_check(phase, true);
+        next
     } else {
         phase
     }
@@ -56,18 +63,35 @@ fn on_outage_alert_result(phase: Phase, send_succeeded: bool) -> Phase {
 
 struct MonitorState {
     last_seen: Instant,
+    last_alert: Option<Instant>,
     phase: Phase,
+    epoch: Instant,
 }
 
 impl MonitorState {
     fn new() -> Self {
+        let epoch = Instant::now();
         Self {
-            last_seen: Instant::now(),
+            last_seen: epoch,
+            last_alert: None,
             phase: Phase::Healthy,
+            epoch,
         }
     }
 
+    fn secs_since_epoch(&self, instant: Instant) -> u64 {
+        instant
+            .checked_duration_since(self.epoch)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    fn now_secs(&self) -> u64 {
+        self.secs_since_epoch(Instant::now())
+    }
+
     /// Check if the monitor is currently stale and needs an outage alert.
+    #[cfg(test)]
     fn check_staleness(&self, timeout_secs: u64) -> (bool, Alert) {
         let elapsed = self.last_seen.elapsed().as_secs();
         let is_stale = elapsed > timeout_secs;
@@ -76,27 +100,30 @@ impl MonitorState {
     }
 
     /// Record the outcome of an outage alert send.
-    /// Only updates phase to Outage and resets last_seen if sending succeeded.
+    /// Only updates phase to Outage and sets last_alert if sending succeeded.
+    /// Note: last_seen is NOT reset on staleness/alert.
     fn record_outage_result(&mut self, send_succeeded: bool) {
         self.phase = on_outage_alert_result(self.phase, send_succeeded);
         if send_succeeded {
-            // Prevent repeat alerts until next heartbeat or debounce window
-            self.last_seen = Instant::now();
+            self.last_alert = Some(Instant::now());
         }
     }
 
-    /// Record incoming heartbeat: updates last_seen and transitions phase back to Healthy.
+    /// Record incoming heartbeat: updates last_seen, clears last_alert, and transitions phase.
     fn record_heartbeat(&mut self) -> Alert {
         self.last_seen = Instant::now();
+        self.last_alert = None;
         let (next, alert) = on_heartbeat(self.phase);
         self.phase = next;
         alert
     }
 }
 
-// Shared monitor state (last heartbeat + outage/recovery phase)
+// Shared monitor state (last heartbeat + last alert + outage/recovery phase)
 static MONITOR: Lazy<Arc<Mutex<MonitorState>>> =
     Lazy::new(|| Arc::new(Mutex::new(MonitorState::new())));
+
+static TIMEOUT_SECS: AtomicU64 = AtomicU64::new(90);
 
 #[derive(Clone)]
 struct NotifyConfig {
@@ -138,11 +165,31 @@ async fn send_pushover(client: &Client, cfg: &NotifyConfig, message: &str) -> bo
 async fn heartbeat(client: web::Data<Client>, cfg: web::Data<NotifyConfig>) -> impl Responder {
     let (alert, recovery_message) = {
         let mut mon = MONITOR.lock().unwrap();
+        let now = Instant::now();
+        let now_secs = mon.secs_since_epoch(now);
+        let prev_secs = mon.secs_since_epoch(mon.last_seen);
+        let in_outage = mon.phase == Phase::Outage;
+        let timeout = TIMEOUT_SECS.load(Ordering::Relaxed);
+        let decision = evaluate_heartbeat(now_secs, prev_secs, in_outage, timeout);
+
         let alert = mon.record_heartbeat();
-        info!(
-            "Heartbeat received at {:?}; phase={:?}",
-            mon.last_seen, mon.phase
-        );
+
+        match decision {
+            HeartbeatDecision::Recorded => {
+                info!(
+                    "Heartbeat received at {:?}; phase={:?}",
+                    mon.last_seen, mon.phase
+                );
+            }
+            HeartbeatDecision::Recovered {
+                outage_duration_secs,
+            } => {
+                info!(
+                    "Heartbeat received at {:?} — recovered after {}s without heartbeat; phase={:?}",
+                    mon.last_seen, outage_duration_secs, mon.phase
+                );
+            }
+        }
         (alert, cfg.recovery_message.clone())
     };
 
@@ -182,6 +229,8 @@ async fn main() -> std::io::Result<()> {
         .parse()
         .expect("DEBOUNCE_SECS must be a number");
 
+    TIMEOUT_SECS.store(timeout_secs, Ordering::Relaxed);
+
     let notify = NotifyConfig {
         token: pushover_token,
         user: pushover_user,
@@ -192,39 +241,58 @@ async fn main() -> std::io::Result<()> {
     let client = Client::new();
 
     // Spawn the staleness-check task
-    let mut connection_missing: bool = false;
     let watcher_client = client.clone();
     let watcher_notify = notify.clone();
     spawn(async move {
         loop {
-            let mut time_interval = check_interval;
-            if connection_missing {
-                info!("Starting debounce now that we alerted");
-                time_interval = debounce_secs;
-            }
-            time::sleep(Duration::from_secs(time_interval)).await;
-            connection_missing = false;
+            time::sleep(Duration::from_secs(check_interval)).await;
 
-            let (alert, outage_message) = {
+            let (decision, outage_message) = {
                 let mon = MONITOR.lock().unwrap();
-                let elapsed = mon.last_seen.elapsed().as_secs();
-                let (is_stale, alert) = mon.check_staleness(timeout_secs);
-                if is_stale {
-                    warn!(
-                        "No heartbeat for {}s (> {}s). phase={:?}, alert={:?}",
-                        elapsed, timeout_secs, mon.phase, alert
-                    );
-                }
-                (alert, watcher_notify.outage_message.clone())
+                let now_secs = mon.now_secs();
+                let last_hb = mon.secs_since_epoch(mon.last_seen);
+                let last_alert = mon.last_alert.map(|t| mon.secs_since_epoch(t));
+                let decision =
+                    evaluate_check(now_secs, last_hb, last_alert, timeout_secs, debounce_secs);
+                (decision, watcher_notify.outage_message.clone())
             };
 
-            if alert == Alert::Outage {
-                if send_pushover(&watcher_client, &watcher_notify, &outage_message).await {
+            match decision {
+                CheckDecision::Healthy {
+                    secs_since_heartbeat,
+                } => {
+                    info!(
+                        "Heartbeat fresh ({}s ago, timeout {}s)",
+                        secs_since_heartbeat, timeout_secs
+                    );
+                }
+                CheckDecision::StillDown {
+                    secs_since_heartbeat,
+                    secs_since_alert,
+                    secs_until_next_alert,
+                } => {
+                    info!(
+                        "Still down: no heartbeat for {}s; last alert {}s ago; next alert in {}s (debounce {}s)",
+                        secs_since_heartbeat,
+                        secs_since_alert,
+                        secs_until_next_alert,
+                        debounce_secs
+                    );
+                }
+                CheckDecision::AlertOutage {
+                    secs_since_heartbeat,
+                } => {
+                    warn!(
+                        "No heartbeat for {}s (> {}s). Sending Pushover outage alert.",
+                        secs_since_heartbeat, timeout_secs
+                    );
+                    let sent =
+                        send_pushover(&watcher_client, &watcher_notify, &outage_message).await;
                     let mut mon = MONITOR.lock().unwrap();
-                    mon.record_outage_result(true);
-                    connection_missing = true;
-                } else {
-                    warn!("Failed to send outage alert; leaving monitor phase and last_seen unchanged");
+                    mon.record_outage_result(sent);
+                    if !sent {
+                        warn!("Failed to send outage alert; leaving monitor phase and last_seen unchanged");
+                    }
                 }
             }
         }
@@ -247,6 +315,7 @@ async fn main() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
+        monitor::{evaluate_check, CheckDecision},
         on_heartbeat, on_outage_alert_result, on_staleness_check, send_pushover, Alert,
         MonitorState, NotifyConfig, Phase,
     };
@@ -334,6 +403,58 @@ mod tests {
     }
 
     #[test]
+    fn monitor_state_outage_alert_does_not_reset_last_seen() {
+        let mut mon = MonitorState::new();
+        let initial_last_seen = mon.last_seen;
+
+        // Simulate outage alert being sent
+        mon.record_outage_result(true);
+
+        // last_seen must remain unchanged (not reset to now on alert)
+        assert_eq!(mon.last_seen, initial_last_seen);
+        assert_eq!(mon.phase, Phase::Outage);
+        assert!(mon.last_alert.is_some());
+    }
+
+    #[test]
+    fn monitor_state_true_downtime_preserved_across_debounce() {
+        let timeout_secs = 90;
+        let debounce_secs = 300;
+
+        // Heartbeat was at epoch (t=0)
+        let last_hb_secs = 0;
+
+        // At t=100 (past timeout, no previous alert): AlertOutage
+        let decision = evaluate_check(100, last_hb_secs, None, timeout_secs, debounce_secs);
+        assert_eq!(
+            decision,
+            CheckDecision::AlertOutage {
+                secs_since_heartbeat: 100
+            }
+        );
+
+        // Alert sent at t=100. Debouncing at t=200: StillDown, true downtime is 200s
+        let decision = evaluate_check(200, last_hb_secs, Some(100), timeout_secs, debounce_secs);
+        assert_eq!(
+            decision,
+            CheckDecision::StillDown {
+                secs_since_heartbeat: 200,
+                secs_since_alert: 100,
+                secs_until_next_alert: 200,
+            }
+        );
+
+        // After debounce at t=400: AlertOutage with true downtime 400s (not 300s!)
+        let decision = evaluate_check(400, last_hb_secs, Some(100), timeout_secs, debounce_secs);
+        assert_eq!(
+            decision,
+            CheckDecision::AlertOutage {
+                secs_since_heartbeat: 400
+            }
+        );
+    }
+
+    #[test]
     fn outage_alert_result_only_transitions_on_success() {
         assert_eq!(
             on_outage_alert_result(Phase::Healthy, false),
@@ -353,9 +474,10 @@ mod tests {
         assert!(is_stale);
         assert_eq!(alert, Alert::Outage);
 
-        // Failed send: phase must stay Healthy and last_seen must NOT be cleared
+        // Failed send: phase must stay Healthy, last_alert must be None, and last_seen must NOT be cleared
         mon.record_outage_result(false);
         assert_eq!(mon.phase, Phase::Healthy);
+        assert_eq!(mon.last_alert, None);
         assert!(mon.last_seen.elapsed().as_secs() >= 100);
 
         // Next check immediately still sees staleness (not suppressed)
@@ -370,22 +492,24 @@ mod tests {
     }
 
     #[test]
-    fn successful_outage_send_records_outage_and_resets_last_seen() {
+    fn successful_outage_send_records_outage_and_preserves_last_seen() {
         let mut mon = MonitorState::new();
         mon.last_seen = Instant::now() - Duration::from_secs(100);
         let (is_stale, alert) = mon.check_staleness(90);
         assert!(is_stale);
         assert_eq!(alert, Alert::Outage);
 
-        // Succeeded send: phase becomes Outage and last_seen is reset to now
+        // Succeeded send: phase becomes Outage, last_alert is recorded, and last_seen is NOT reset
         mon.record_outage_result(true);
         assert_eq!(mon.phase, Phase::Outage);
-        assert!(mon.last_seen.elapsed().as_secs() < 2);
+        assert!(mon.last_alert.is_some());
+        assert!(mon.last_seen.elapsed().as_secs() >= 100);
 
         // Subsequent heartbeat fires recovery
         let hb_alert = mon.record_heartbeat();
         assert_eq!(hb_alert, Alert::Recovery);
         assert_eq!(mon.phase, Phase::Healthy);
+        assert_eq!(mon.last_alert, None);
 
         // Next heartbeat after recovery does not fire recovery again
         let hb_alert2 = mon.record_heartbeat();
