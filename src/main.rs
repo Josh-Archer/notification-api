@@ -3,7 +3,9 @@ mod monitor;
 use actix_web::{get, web, App, HttpServer, Responder};
 use dotenv::dotenv;
 use log::{info, warn};
-use monitor::{evaluate_check, evaluate_heartbeat, CheckDecision, HeartbeatDecision};
+use monitor::{
+    evaluate_check, evaluate_heartbeat, format_outage_message, CheckDecision, HeartbeatDecision,
+};
 use once_cell::sync::Lazy;
 use reqwest::Client;
 use std::{
@@ -286,8 +288,8 @@ async fn main() -> std::io::Result<()> {
                         "No heartbeat for {}s (> {}s). Sending Pushover outage alert.",
                         secs_since_heartbeat, timeout_secs
                     );
-                    let sent =
-                        send_pushover(&watcher_client, &watcher_notify, &outage_message).await;
+                    let alert_msg = format_outage_message(&outage_message, secs_since_heartbeat);
+                    let sent = send_pushover(&watcher_client, &watcher_notify, &alert_msg).await;
                     let mut mon = MONITOR.lock().unwrap();
                     mon.record_outage_result(sent);
                     if !sent {
@@ -315,7 +317,7 @@ async fn main() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        monitor::{evaluate_check, CheckDecision},
+        monitor::{evaluate_check, format_outage_message, CheckDecision},
         on_heartbeat, on_outage_alert_result, on_staleness_check, send_pushover, Alert,
         MonitorState, NotifyConfig, Phase,
     };
@@ -432,6 +434,10 @@ mod tests {
                 secs_since_heartbeat: 100
             }
         );
+        assert_eq!(
+            format_outage_message("❌ Poop Monitor is offline!", 100),
+            "❌ Poop Monitor is offline! (down for 100s)"
+        );
 
         // Alert sent at t=100. Debouncing at t=200: StillDown, true downtime is 200s
         let decision = evaluate_check(200, last_hb_secs, Some(100), timeout_secs, debounce_secs);
@@ -451,6 +457,10 @@ mod tests {
             CheckDecision::AlertOutage {
                 secs_since_heartbeat: 400
             }
+        );
+        assert_eq!(
+            format_outage_message("❌ Poop Monitor is offline!", 400),
+            "❌ Poop Monitor is offline! (down for 400s)"
         );
     }
 
@@ -633,5 +643,60 @@ mod tests {
         // A subsequent heartbeat does NOT emit a false recovery alert
         let (_, alert) = on_heartbeat(mon.phase);
         assert_eq!(alert, Alert::None);
+    }
+
+    #[test]
+    fn outage_alert_message_formatting() {
+        let default_msg = "❌ Poop Monitor is offline!";
+        assert_eq!(
+            format_outage_message(default_msg, 95),
+            "❌ Poop Monitor is offline! (down for 95s)"
+        );
+        assert_eq!(
+            format_outage_message("Database down", 300),
+            "Database down (down for 300s)"
+        );
+    }
+
+    #[actix_web::test]
+    async fn send_pushover_sends_formatted_outage_alert_with_downtime() {
+        let received_body = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let body_clone = received_body.clone();
+
+        let server = HttpServer::new(move || {
+            let body_clone = body_clone.clone();
+            App::new().route(
+                "/pushover",
+                web::post().to(move |body: web::Bytes| {
+                    let mut b = body_clone.lock().unwrap();
+                    *b = String::from_utf8_lossy(&body).into_owned();
+                    async { HttpResponse::Ok().body("{\"status\":1}") }
+                }),
+            )
+        })
+        .bind(("127.0.0.1", 0))
+        .expect("bind mock server");
+
+        let port = server.addrs()[0].port();
+        let _server_handle = tokio::spawn(server.run());
+
+        let client = Client::new();
+        let cfg = NotifyConfig {
+            token: "test_token".into(),
+            user: "test_user".into(),
+            outage_message: "❌ Poop Monitor is offline!".into(),
+            recovery_message: "recovery".into(),
+            pushover_url: format!("http://127.0.0.1:{}/pushover", port),
+        };
+
+        let secs_since_heartbeat = 150;
+        let formatted = format_outage_message(&cfg.outage_message, secs_since_heartbeat);
+        assert_eq!(formatted, "❌ Poop Monitor is offline! (down for 150s)");
+
+        let sent = send_pushover(&client, &cfg, &formatted).await;
+        assert!(sent);
+
+        let body = received_body.lock().unwrap().clone();
+        assert!(body.contains("down+for+150s") || body.contains("down for 150s"));
     }
 }

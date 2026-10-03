@@ -272,7 +272,8 @@ pub fn spawn_staleness_watcher(notify: NotifyConfig, watcher: WatcherConfig) {
                     watcher.timeout_secs,
                     notify.backend_names()
                 );
-                send_alert(&client, &notify, "❌ Poop Monitor is offline!").await;
+                let alert_msg = format!("❌ Poop Monitor is offline! (down for {}s)", elapsed);
+                send_alert(&client, &notify, &alert_msg).await;
                 connection_missing = true;
                 // Prevent repeat alerts until next heartbeat resets LAST_SEEN
                 let mut last = LAST_SEEN.lock().unwrap();
