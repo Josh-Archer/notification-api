@@ -16,7 +16,7 @@ The service exposes `GET /heartbeat/poop`. A background task watches the last he
 
 | Event | Condition | Notification |
 |-------|-----------|--------------|
-| **Outage** | No heartbeat for longer than `HEARTBEAT_TIMEOUT_SECS` | `OUTAGE_MESSAGE` |
+| **Outage** | No heartbeat for longer than `HEARTBEAT_TIMEOUT_SECS` | `OUTAGE_MESSAGE` (with measured downtime, e.g. `(down for 100s)`) |
 | **Recovery** | First heartbeat after an outage alert was sent | `RECOVERY_MESSAGE` |
 
 Recovery fires **only** after a prior outage alert (not on ordinary heartbeats or startup). While still offline, outage alerts may repeat after `DEBOUNCE_SECS`.
@@ -89,7 +89,7 @@ Now, every time you push, lefthook will bump the minor version and amend your co
 | `HEARTBEAT_TIMEOUT_SECS` | no | `90` | Seconds without a heartbeat before outage alert |
 | `CHECK_INTERVAL_SECS` | no | `10` | How often to check staleness while healthy |
 | `DEBOUNCE_SECS` | no | `300` | Wait between repeat outage alerts |
-| `OUTAGE_MESSAGE` | no | `❌ Poop Monitor is offline!` | Pushover text for outage |
+| `OUTAGE_MESSAGE` | no | `❌ Poop Monitor is offline!` | Pushover text for outage (appended with measured downtime, e.g. `(down for 100s)`) |
 | `RECOVERY_MESSAGE` | no | `✅ Poop Monitor is back online!` | Pushover text when heartbeats resume after outage |
 
 ### Tests

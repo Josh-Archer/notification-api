@@ -94,6 +94,16 @@ pub fn evaluate_heartbeat(
     }
 }
 
+/// Format the outage alert message to include measured downtime in seconds.
+pub fn format_outage_message(base_message: &str, secs_since_heartbeat: u64) -> String {
+    let trimmed = base_message.trim();
+    if trimmed.is_empty() {
+        format!("(down for {}s)", secs_since_heartbeat)
+    } else {
+        format!("{} (down for {}s)", trimmed, secs_since_heartbeat)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,6 +300,10 @@ mod tests {
                 secs_since_heartbeat,
             } => {
                 assert_eq!(secs_since_heartbeat, 100);
+                assert_eq!(
+                    format_outage_message("❌ Poop Monitor is offline!", secs_since_heartbeat),
+                    "❌ Poop Monitor is offline! (down for 100s)"
+                );
                 last_alert = Some(100);
                 in_outage = true;
             }
@@ -316,6 +330,10 @@ mod tests {
                 secs_since_heartbeat,
             } => {
                 assert_eq!(secs_since_heartbeat, 400);
+                assert_eq!(
+                    format_outage_message("❌ Poop Monitor is offline!", secs_since_heartbeat),
+                    "❌ Poop Monitor is offline! (down for 400s)"
+                );
                 last_alert = Some(400);
             }
             other => panic!("expected re-alert, got {other:?}"),
@@ -341,5 +359,25 @@ mod tests {
             }
         ));
         assert!(!in_outage);
+    }
+
+    // --- format_outage_message tests ---
+
+    #[test]
+    fn format_outage_message_includes_measured_downtime() {
+        assert_eq!(
+            format_outage_message("❌ Poop Monitor is offline!", 91),
+            "❌ Poop Monitor is offline! (down for 91s)"
+        );
+        assert_eq!(
+            format_outage_message("❌ Poop Monitor is offline!", 400),
+            "❌ Poop Monitor is offline! (down for 400s)"
+        );
+        assert_eq!(
+            format_outage_message("Custom alert", 120),
+            "Custom alert (down for 120s)"
+        );
+        assert_eq!(format_outage_message("Alert", 0), "Alert (down for 0s)");
+        assert_eq!(format_outage_message("", 50), "(down for 50s)");
     }
 }
