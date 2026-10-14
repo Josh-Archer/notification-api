@@ -23,6 +23,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use subtle::ConstantTimeEq;
 use tokio::{spawn, time};
 
 /// Process start time (unix seconds) for health reporting.
@@ -185,7 +186,10 @@ fn port_from_env() -> u16 {
 }
 
 fn heartbeat_secret_from_env() -> Result<String, String> {
-    env_non_empty("HEARTBEAT_SECRET")
+    env::var("HEARTBEAT_SECRET")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
         .ok_or_else(|| "HEARTBEAT_SECRET must be set to protect /heartbeat/poop".into())
 }
 
@@ -419,12 +423,12 @@ async fn heartbeat(
     monitor: web::Data<Mutex<MonitorState>>,
     secret: web::Data<String>,
 ) -> HttpResponse {
-    let expected = format!("Bearer {}", secret.get_ref());
     let authorized = request
         .headers()
         .get(actix_web::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value == expected.as_str());
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|token| bool::from(token.as_bytes().ct_eq(secret.as_bytes())));
     if !authorized {
         return HttpResponse::Unauthorized().finish();
     }
@@ -813,6 +817,16 @@ mod tests {
             ))
             .await
         };
+        ($notify:expr, $monitor:expr, $secret:expr) => {
+            aw_test::init_service(create_app(
+                $notify,
+                sample_watcher(),
+                $monitor,
+                test_client(),
+                $secret.into(),
+            ))
+            .await
+        };
     }
 
     #[test]
@@ -841,7 +855,11 @@ mod tests {
         assert!(heartbeat_secret_from_env().is_err());
         std::env::set_var("HEARTBEAT_SECRET", "REPLACE_ME");
         assert_eq!(heartbeat_secret_from_env().unwrap(), "REPLACE_ME");
+        std::env::set_var("HEARTBEAT_SECRET", "  trimmed-secret \t\n");
+        assert_eq!(heartbeat_secret_from_env().unwrap(), "trimmed-secret");
         std::env::set_var("HEARTBEAT_SECRET", "");
+        assert!(heartbeat_secret_from_env().is_err());
+        std::env::set_var("HEARTBEAT_SECRET", " \t\n ");
         assert!(heartbeat_secret_from_env().is_err());
     }
 
@@ -1462,7 +1480,7 @@ mod tests {
         let last_seen = monitor.lock().unwrap().last_seen;
         let app = shipped_app!(notify, Arc::clone(&monitor));
 
-        for authorization in [None, Some("Bearer incorrect")] {
+        for authorization in [None, Some("Bearer xxxxxxxxxx"), Some("Bearer short")] {
             let mut request = aw_test::TestRequest::get().uri("/heartbeat/poop");
             if let Some(value) = authorization {
                 request = request.insert_header((actix_web::http::header::AUTHORIZATION, value));
@@ -1475,6 +1493,27 @@ mod tests {
         assert_eq!(mon.last_seen, last_seen);
         assert_eq!(mon.phase, Phase::Outage);
         assert!(hits_of(&mock).is_empty());
+    }
+
+    #[actix_web::test]
+    async fn heartbeat_accepts_correct_secret() {
+        let notify = sample_notify(None, None);
+        let monitor = Arc::new(Mutex::new(MonitorState::new()));
+        let app = shipped_app!(notify, monitor, "trimmed-secret");
+
+        let response = aw_test::call_service(
+            &app,
+            aw_test::TestRequest::get()
+                .uri("/heartbeat/poop")
+                .insert_header((
+                    actix_web::http::header::AUTHORIZATION,
+                    "Bearer trimmed-secret",
+                ))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[actix_web::test]
