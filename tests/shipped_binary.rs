@@ -13,6 +13,10 @@ const CONFIG_KEYS: &[&str] = &[
     "PUSHOVER_TOKEN",
     "PUSHOVER_USER",
     "PUSHOVER_URL",
+    "PUSHOVER_TITLE",
+    "PUSHOVER_PRIORITY",
+    "PUSHOVER_SOUND",
+    "PUSHOVER_DEVICE",
     "NTFY_TOPIC",
     "NTFY_SERVER",
     "NTFY_TOKEN",
@@ -248,6 +252,58 @@ fn shipped_binary_exits_when_no_backend_is_configured() {
     );
     assert!(
         stderr.contains("At least one notification backend"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn shipped_binary_starts_with_optional_pushover_settings() {
+    let port = free_port();
+    let mut env = base_env(port);
+    env.push(("PUSHOVER_TOKEN", "REPLACE_ME".into()));
+    env.push(("PUSHOVER_USER", "REPLACE_ME".into()));
+    env.push(("PUSHOVER_TITLE", "Monitor".into()));
+    env.push(("PUSHOVER_PRIORITY", "1".into()));
+    env.push(("PUSHOVER_SOUND", "cosmic".into()));
+    env.push(("PUSHOVER_DEVICE", "pixel".into()));
+    let owned: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let mut running = spawn_binary(&owned);
+
+    let (code, body) = wait_http(&mut running, port, "/healthz");
+    assert_eq!(code, 200, "GET /healthz body: {body}");
+    assert!(
+        body.contains("\"backends\":[\"pushover\"]"),
+        "health payload: {body}"
+    );
+}
+
+#[test]
+fn shipped_binary_exits_when_pushover_priority_is_invalid() {
+    let port = free_port();
+    let mut env = base_env(port);
+    env.push(("PUSHOVER_TOKEN", "REPLACE_ME".into()));
+    env.push(("PUSHOVER_USER", "REPLACE_ME".into()));
+    env.push(("PUSHOVER_PRIORITY", "invalid-number".into()));
+    let owned: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let mut running = spawn_binary(&owned);
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = try_exit(&mut running.child) {
+            break status;
+        }
+        if Instant::now() > deadline {
+            panic!("binary kept running with invalid priority");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    let stderr = running.stderr_text();
+    assert!(
+        !status.success(),
+        "expected non-zero exit, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("PUSHOVER_PRIORITY must be a number"),
         "stderr: {stderr}"
     );
 }

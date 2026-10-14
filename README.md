@@ -88,6 +88,10 @@ Now, every time you push, lefthook will bump the minor version and amend your co
 | `PUSHOVER_TOKEN` | with `PUSHOVER_USER`, unless ntfy is set | — | Pushover application token. Blank is ignored |
 | `PUSHOVER_USER` | with `PUSHOVER_TOKEN`, unless ntfy is set | — | Pushover user/group key. Blank is ignored |
 | `PUSHOVER_URL` | no | `https://api.pushover.net/1/messages.json` | Pushover messages endpoint |
+| `PUSHOVER_TITLE` | no | — | Optional Pushover notification title |
+| `PUSHOVER_PRIORITY` | no | — | Optional Pushover notification priority (-2 to 2) |
+| `PUSHOVER_SOUND` | no | — | Optional Pushover notification sound |
+| `PUSHOVER_DEVICE` | no | — | Optional Pushover device name |
 | `NTFY_TOPIC` | unless Pushover is set | — | ntfy topic. Enables ntfy, including ntfy-only mode |
 | `NTFY_SERVER` | no | `https://ntfy.sh` | ntfy base URL, no trailing slash required |
 | `NTFY_TOKEN` | no | — | Optional ntfy bearer token |

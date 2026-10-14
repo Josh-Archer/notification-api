@@ -46,6 +46,10 @@ pub struct PushoverConfig {
     pub user: String,
     /// Full messages URL. Defaults to the public Pushover API.
     pub url: String,
+    pub title: Option<String>,
+    pub priority: Option<i32>,
+    pub sound: Option<String>,
+    pub device: Option<String>,
 }
 
 /// ntfy topic / server settings.
@@ -78,7 +82,8 @@ impl NotifyConfig {
     /// `PUSHOVER_*` defaults and still start on ntfy alone.
     ///
     /// - Pushover: `PUSHOVER_TOKEN` + `PUSHOVER_USER` (both required to enable).
-    ///   Optional `PUSHOVER_URL` (default `https://api.pushover.net/1/messages.json`).
+    ///   Optional `PUSHOVER_URL` (default `https://api.pushover.net/1/messages.json`),
+    ///   `PUSHOVER_TITLE`, `PUSHOVER_PRIORITY`, `PUSHOVER_SOUND`, `PUSHOVER_DEVICE`.
     /// - ntfy: `NTFY_TOPIC` (required to enable). Optional `NTFY_SERVER`
     ///   (default `https://ntfy.sh`) and `NTFY_TOKEN`.
     /// - Copy: `OUTAGE_MESSAGE`, `RECOVERY_MESSAGE`.
@@ -87,12 +92,25 @@ impl NotifyConfig {
             env_non_empty("PUSHOVER_TOKEN"),
             env_non_empty("PUSHOVER_USER"),
         ) {
-            (Some(token), Some(user)) => Some(PushoverConfig {
-                token,
-                user,
-                url: env_non_empty("PUSHOVER_URL")
-                    .unwrap_or_else(|| DEFAULT_PUSHOVER_URL.to_string()),
-            }),
+            (Some(token), Some(user)) => {
+                let priority = match env_non_empty("PUSHOVER_PRIORITY") {
+                    Some(val) => match val.parse::<i32>() {
+                        Ok(p) => Some(p),
+                        Err(_) => return Err("PUSHOVER_PRIORITY must be a number".into()),
+                    },
+                    None => None,
+                };
+                Some(PushoverConfig {
+                    token,
+                    user,
+                    url: env_non_empty("PUSHOVER_URL")
+                        .unwrap_or_else(|| DEFAULT_PUSHOVER_URL.to_string()),
+                    title: env_non_empty("PUSHOVER_TITLE"),
+                    priority,
+                    sound: env_non_empty("PUSHOVER_SOUND"),
+                    device: env_non_empty("PUSHOVER_DEVICE"),
+                })
+            }
             (None, None) => None,
             _ => {
                 return Err(
@@ -185,12 +203,26 @@ fn port_from_env() -> u16 {
 }
 
 /// POST one Pushover message. `true` only when the HTTP status is success.
-async fn send_pushover(client: &Client, pushover: &PushoverConfig, message: &str) -> bool {
-    let params = [
+pub async fn send_pushover(client: &Client, pushover: &PushoverConfig, message: &str) -> bool {
+    let priority_str;
+    let mut params = vec![
         ("token", pushover.token.as_str()),
         ("user", pushover.user.as_str()),
         ("message", message),
     ];
+    if let Some(title) = &pushover.title {
+        params.push(("title", title.as_str()));
+    }
+    if let Some(priority) = pushover.priority {
+        priority_str = priority.to_string();
+        params.push(("priority", priority_str.as_str()));
+    }
+    if let Some(sound) = &pushover.sound {
+        params.push(("sound", sound.as_str()));
+    }
+    if let Some(device) = &pushover.device {
+        params.push(("device", device.as_str()));
+    }
     match client.post(&pushover.url).form(&params).send().await {
         Ok(response) => {
             let status = response.status();
@@ -624,6 +656,10 @@ mod tests {
             "PUSHOVER_TOKEN",
             "PUSHOVER_USER",
             "PUSHOVER_URL",
+            "PUSHOVER_TITLE",
+            "PUSHOVER_PRIORITY",
+            "PUSHOVER_SOUND",
+            "PUSHOVER_DEVICE",
             "NTFY_TOPIC",
             "NTFY_SERVER",
             "NTFY_TOKEN",
@@ -652,6 +688,10 @@ mod tests {
             token: "REPLACE_ME".into(),
             user: "REPLACE_ME".into(),
             url: url.into(),
+            title: None,
+            priority: None,
+            sound: None,
+            device: None,
         }
     }
 
@@ -832,10 +872,62 @@ mod tests {
         assert_eq!(pushover.token, "REPLACE_ME");
         assert_eq!(pushover.user, "REPLACE_ME");
         assert_eq!(pushover.url, "http://127.0.0.1:9/messages.json");
+        assert_eq!(pushover.title, None);
+        assert_eq!(pushover.priority, None);
+        assert_eq!(pushover.sound, None);
+        assert_eq!(pushover.device, None);
         let ntfy = cfg.ntfy.expect("ntfy enabled");
         assert_eq!(ntfy.topic, "mytopic");
         assert_eq!(ntfy.server, "https://ntfy.example.com");
         assert_eq!(ntfy.token.as_deref(), Some("REPLACE_ME"));
+    }
+
+    #[test]
+    fn notify_config_from_env_pushover_optional_fields() {
+        let _lock = env_lock();
+        let _clean = EnvGuard::enter();
+        std::env::set_var("PUSHOVER_TOKEN", "REPLACE_ME");
+        std::env::set_var("PUSHOVER_USER", "REPLACE_ME");
+        std::env::set_var("PUSHOVER_TITLE", "Custom Title");
+        std::env::set_var("PUSHOVER_PRIORITY", "1");
+        std::env::set_var("PUSHOVER_SOUND", "cosmic");
+        std::env::set_var("PUSHOVER_DEVICE", "myphone");
+
+        let cfg = NotifyConfig::from_env().expect("should load");
+        let pushover = cfg.pushover.expect("pushover enabled");
+        assert_eq!(pushover.title.as_deref(), Some("Custom Title"));
+        assert_eq!(pushover.priority, Some(1));
+        assert_eq!(pushover.sound.as_deref(), Some("cosmic"));
+        assert_eq!(pushover.device.as_deref(), Some("myphone"));
+
+        // Verify negative priority works as well
+        std::env::set_var("PUSHOVER_PRIORITY", "-1");
+        let cfg_neg = NotifyConfig::from_env().expect("should load negative priority");
+        assert_eq!(cfg_neg.pushover.unwrap().priority, Some(-1));
+
+        // Verify blank values are treated as unset
+        std::env::set_var("PUSHOVER_TITLE", "");
+        std::env::set_var("PUSHOVER_PRIORITY", "");
+        std::env::set_var("PUSHOVER_SOUND", "");
+        std::env::set_var("PUSHOVER_DEVICE", "");
+        let cfg_blank = NotifyConfig::from_env().expect("should load blank optional fields");
+        let p_blank = cfg_blank.pushover.unwrap();
+        assert_eq!(p_blank.title, None);
+        assert_eq!(p_blank.priority, None);
+        assert_eq!(p_blank.sound, None);
+        assert_eq!(p_blank.device, None);
+    }
+
+    #[test]
+    fn notify_config_from_env_pushover_rejects_invalid_priority() {
+        let _lock = env_lock();
+        let _clean = EnvGuard::enter();
+        std::env::set_var("PUSHOVER_TOKEN", "REPLACE_ME");
+        std::env::set_var("PUSHOVER_USER", "REPLACE_ME");
+        std::env::set_var("PUSHOVER_PRIORITY", "not-a-number");
+
+        let err = NotifyConfig::from_env().unwrap_err();
+        assert!(err.contains("PUSHOVER_PRIORITY must be a number"));
     }
 
     #[test]
@@ -1156,6 +1248,93 @@ mod tests {
 
         cfg.url = "http://127.0.0.1:1/nonexistent".into();
         assert!(!send_pushover(&client, &cfg, "msg").await);
+    }
+
+    #[actix_web::test]
+    async fn send_pushover_posts_all_optional_fields_when_present() {
+        let mock = spawn_mock().await;
+        let mut cfg = sample_pushover(&format!("http://127.0.0.1:{}/pushover", mock.port));
+        cfg.title = Some("Poop Alert".into());
+        cfg.priority = Some(1);
+        cfg.sound = Some("siren".into());
+        cfg.device = Some("pixel-8".into());
+
+        let client = test_client();
+        let ok = send_pushover(&client, &cfg, "warning message").await;
+        assert!(ok);
+
+        let hits = hits_of(&mock);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "/pushover");
+        assert!(hits[0].body.contains("token=REPLACE_ME"));
+        assert!(hits[0].body.contains("user=REPLACE_ME"));
+        let decoded = decoded_body(&hits[0].body);
+        assert!(decoded.contains("message=warning message"));
+        assert!(decoded.contains("title=Poop Alert"));
+        assert!(hits[0].body.contains("priority=1"));
+        assert!(hits[0].body.contains("sound=siren"));
+        assert!(hits[0].body.contains("device=pixel-8"));
+    }
+
+    #[actix_web::test]
+    async fn send_pushover_omits_optional_fields_when_none() {
+        let mock = spawn_mock().await;
+        let cfg = sample_pushover(&format!("http://127.0.0.1:{}/pushover", mock.port));
+
+        let client = test_client();
+        let ok = send_pushover(&client, &cfg, "plain message").await;
+        assert!(ok);
+
+        let hits = hits_of(&mock);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "/pushover");
+        assert!(hits[0].body.contains("token=REPLACE_ME"));
+        assert!(hits[0].body.contains("user=REPLACE_ME"));
+        let decoded = decoded_body(&hits[0].body);
+        assert!(decoded.contains("message=plain message"));
+        assert!(!hits[0].body.contains("title="));
+        assert!(!hits[0].body.contains("priority="));
+        assert!(!hits[0].body.contains("sound="));
+        assert!(!hits[0].body.contains("device="));
+    }
+
+    #[actix_web::test]
+    async fn send_pushover_posts_subset_of_optional_fields() {
+        let mock = spawn_mock().await;
+        let mut cfg = sample_pushover(&format!("http://127.0.0.1:{}/pushover", mock.port));
+        cfg.priority = Some(-1);
+        cfg.sound = Some("quiet".into());
+
+        let client = test_client();
+        let ok = send_pushover(&client, &cfg, "quiet message").await;
+        assert!(ok);
+
+        let hits = hits_of(&mock);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].body.contains("priority=-1"));
+        assert!(hits[0].body.contains("sound=quiet"));
+        assert!(!hits[0].body.contains("title="));
+        assert!(!hits[0].body.contains("device="));
+    }
+
+    #[actix_web::test]
+    async fn send_alert_pushover_with_optional_fields() {
+        let mock = spawn_mock().await;
+        let mut pushover = sample_pushover(&format!("http://127.0.0.1:{}/pushover", mock.port));
+        pushover.title = Some("Outage".into());
+        pushover.priority = Some(1);
+        pushover.sound = Some("falling".into());
+        pushover.device = Some("nexus".into());
+        let notify = sample_notify(Some(pushover), None);
+
+        let ok = send_alert(&test_client(), &notify, "synthetic-alert").await;
+        assert!(ok);
+        let hits = hits_of(&mock);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].body.contains("title=Outage"));
+        assert!(hits[0].body.contains("priority=1"));
+        assert!(hits[0].body.contains("sound=falling"));
+        assert!(hits[0].body.contains("device=nexus"));
     }
 
     #[actix_web::test]
