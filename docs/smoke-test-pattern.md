@@ -39,9 +39,13 @@ This repository adopts the pattern as follows. Other services still need their o
 | `scripts/smoke_notification_fixture.py` | Listens on `127.0.0.1` and records POSTs. It does not forward them. |
 | `tests/smoke_entrypoint.rs` | Runs the same script against the binary Cargo just built, so `cargo test` fails when the entrypoint drifts. |
 
-`GET /healthz` on the shipped process reports `status`, `uptime_secs`, `backends`, and `last_heartbeat_secs_ago`. With the synthetic Pushover configuration the smoke test uses, `backends` is `["pushover"]` and both the outage and recovery posts arrive at `PUSHOVER_URL` on the fixture. Placeholder token and user are `REPLACE_ME`.
+`GET /healthz` on the shipped process reports `status`, `uptime_secs`, `backends`, and `last_heartbeat_secs_ago`. The smoke test checks three selections:
 
-ntfy-only startup is a separate change. This smoke test covers the executable the image runs today and will keep covering Pushover selection after that change, as long as `/healthz` still lists `pushover` when only Pushover is configured.
+- Pushover only: `backends` is `["pushover"]`, and the outage and recovery posts arrive at `PUSHOVER_URL` on the fixture. Token and user are `REPLACE_ME`.
+- ntfy only, including blank `PUSHOVER_TOKEN` and `PUSHOVER_USER` (the image default): `backends` is `["ntfy"]`, and posts arrive at `NTFY_SERVER/NTFY_TOPIC` on the fixture.
+- Both: `backends` is `["pushover","ntfy"]`. A healthy process does not send.
+
+No placeholder is a real secret, and the fixture does not forward traffic.
 
 ## Local run
 

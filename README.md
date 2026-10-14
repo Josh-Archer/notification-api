@@ -4,21 +4,21 @@ A Rust-based notification API with Docker deployment and automated versioning.
 
 ## Features
 - Written in Rust using Actix Web
-- Sends notifications via Pushover
+- Sends notifications via Pushover, ntfy, or both
+- `GET /healthz` reports liveness, uptime, enabled backends, and heartbeat age
 - Heartbeat watcher with **outage** and **recovery** alerts
-- `GET /healthz` liveness probe (status, uptime, selected backend, heartbeat age)
 - Automated Docker builds and publishing via GitHub Actions
 - Versioning is managed automatically (minor version bump on push)
 - Uses [lefthook](https://github.com/evilmartians/lefthook) for Git hooks
 
 ## Heartbeat outage & recovery
 
-The service exposes `GET /healthz` and `GET /heartbeat/poop`. A background task watches the last heartbeat time:
+The service exposes `GET /heartbeat/poop`. A background task watches the last heartbeat time:
 
 | Event | Condition | Notification |
 |-------|-----------|--------------|
-| **Outage** | No heartbeat for longer than `HEARTBEAT_TIMEOUT_SECS` | `OUTAGE_MESSAGE` (with measured downtime, e.g. `(down for 100s)`) |
-| **Recovery** | First heartbeat after an outage alert was sent | `RECOVERY_MESSAGE` |
+| **Outage** | No heartbeat for longer than `HEARTBEAT_TIMEOUT_SECS` | `OUTAGE_MESSAGE` (with measured downtime, e.g. `(down for 100s)`) on every enabled backend |
+| **Recovery** | First heartbeat after an outage alert was sent | `RECOVERY_MESSAGE` on every enabled backend |
 
 Recovery fires **only** after a prior outage alert (not on ordinary heartbeats or startup). While still offline, outage alerts may repeat after `DEBOUNCE_SECS`.
 
@@ -75,8 +75,9 @@ Now, every time you push, lefthook will bump the minor version and amend your co
   - Builds a multi-arch image (`linux/amd64`, `linux/arm64`)
   - Always pushes to GHCR: `ghcr.io/josh-archer/notification-api:{version,latest}`
   - Also pushes to Docker Hub when `DOCKER_USERNAME` / `DOCKER_PASSWORD` are valid
+- Pull requests and pushes to `main` also run `.github/workflows/ci.yml`, which tests and smoke-starts the release binary. That job does not publish an image.
 - Required secrets:
-  - `PUSHOVER_TOKEN`, `PUSHOVER_USER` (app runtime/config used by CI env)
+  - `PUSHOVER_TOKEN`, `PUSHOVER_USER` (app runtime/config used by the publish workflow)
   - Optional: `DOCKER_USERNAME`, `DOCKER_PASSWORD` — use a Docker Hub **Access Token** (Read & Write) as the password. Account passwords are rejected and will skip Docker Hub without failing the GHCR publish.
 
 ### Environment Variables
@@ -85,23 +86,20 @@ Now, every time you push, lefthook will bump the minor version and amend your co
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `PUSHOVER_TOKEN` | yes | — | Pushover application token |
-| `PUSHOVER_USER` | yes | — | Pushover user/group key |
-| `PUSHOVER_URL` | no | `https://api.pushover.net/1/messages.json` | Pushover endpoint. Point this at a local fixture in tests. |
-| `PORT` | no | `3000` | HTTP listen port |
+| `PUSHOVER_TOKEN` | with `PUSHOVER_USER`, unless ntfy is set | — | Pushover application token. Blank is ignored |
+| `PUSHOVER_USER` | with `PUSHOVER_TOKEN`, unless ntfy is set | — | Pushover user/group key. Blank is ignored |
+| `PUSHOVER_URL` | no | `https://api.pushover.net/1/messages.json` | Pushover messages endpoint. Point this at a local fixture in tests. |
+| `NTFY_TOPIC` | unless Pushover is set | — | ntfy topic. Enables ntfy, including ntfy-only mode |
+| `NTFY_SERVER` | no | `https://ntfy.sh` | ntfy base URL, no trailing slash required |
+| `NTFY_TOKEN` | no | — | Optional ntfy bearer token |
 | `HEARTBEAT_TIMEOUT_SECS` | no | `90` | Seconds without a heartbeat before outage alert |
-| `CHECK_INTERVAL_SECS` | no | `10` | How often to check staleness while healthy |
-| `DEBOUNCE_SECS` | no | `300` | Wait between repeat outage alerts |
-| `OUTAGE_MESSAGE` | no | `❌ Poop Monitor is offline!` | Pushover text for outage (appended with measured downtime, e.g. `(down for 100s)`) |
-| `RECOVERY_MESSAGE` | no | `✅ Poop Monitor is back online!` | Pushover text when heartbeats resume after outage |
+| `CHECK_INTERVAL_SECS` | no | `10` | How often to check staleness |
+| `DEBOUNCE_SECS` | no | `300` | Minimum gap between repeat outage alerts. Does not reset measured downtime |
+| `OUTAGE_MESSAGE` | no | `❌ Poop Monitor is offline!` | Outage text (appended with measured downtime, e.g. `(down for 100s)`) |
+| `RECOVERY_MESSAGE` | no | `✅ Poop Monitor is back online!` | Text when heartbeats resume after an outage alert |
+| `PORT` | no | `3000` | HTTP port (`GET /healthz`, `GET /heartbeat/poop`) |
 
-`GET /healthz` returns JSON:
-
-```json
-{"status":"ok","uptime_secs":1,"backends":["pushover"],"last_heartbeat_secs_ago":1}
-```
-
-`backends` is the notification backend the running process selected.
+`GET /healthz` returns JSON: `status`, `uptime_secs`, `backends` (`pushover` and/or `ntfy`), and `last_heartbeat_secs_ago`.
 
 ### Tests
 ```bash
@@ -110,11 +108,12 @@ cargo build --release --locked
 bash scripts/smoke-entrypoint.sh target/release/notification-api
 ```
 
-Unit tests cover the outage/recovery state machine (recovery only after a prior outage alert). `scripts/smoke-entrypoint.sh` starts the shipped binary with synthetic configuration and a local fixture. It checks `/healthz`, `/heartbeat/poop`, Pushover backend selection, startup failures, a refused send, and clean `SIGTERM` shutdown. CI runs that script on `target/release/notification-api` (the binary the Dockerfile copies). The reusable pattern is `docs/smoke-test-pattern.md`. Other repositories track their own adoption.
+Unit tests cover the outage/recovery state machine (recovery only after a prior outage alert, independent heartbeat and alert timestamps) and Pushover-only, ntfy-only, and combined delivery against synthetic endpoints. `GET /healthz` is exercised on the same application factory the binary serves.
+
+`scripts/smoke-entrypoint.sh` starts the shipped binary (the file the Dockerfile copies) with synthetic configuration and a local fixture. It checks `/healthz`, `/heartbeat/poop`, Pushover-only, ntfy-only, and combined backend selection, startup failures, a refused send, and clean `SIGTERM` shutdown. CI runs that script on `target/release/notification-api`. The reusable pattern is `docs/smoke-test-pattern.md`. Other repositories track their own adoption.
 
 ## Contributing
 Pull requests are welcome! For major changes, please open an issue first to discuss what you would like to change.
 
 ## License
 MIT
-

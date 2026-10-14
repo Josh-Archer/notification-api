@@ -209,17 +209,19 @@ stop_expect_clean() {
 
 assert_health() {
   local port=$1
+  local expected_backends=$2
   local body
   if ! body=$(curl -fsS --max-time 2 "http://127.0.0.1:${port}/healthz"); then
     die "GET /healthz failed"
   fi
-  BODY="$body" python3 - <<'PY'
+  BODY="$body" EXPECTED_BACKENDS="$expected_backends" python3 - <<'PY'
 import json, os, sys
 body = json.loads(os.environ["BODY"])
+expected = json.loads(os.environ["EXPECTED_BACKENDS"])
 if body.get("status") != "ok":
     sys.exit(f"status: {body}")
-if body.get("backends") != ["pushover"]:
-    sys.exit(f"backend selection: {body}")
+if body.get("backends") != expected:
+    sys.exit(f"backend selection: {body} expected {expected}")
 for key in ("uptime_secs", "last_heartbeat_secs_ago"):
     value = body.get(key)
     if not isinstance(value, int) or value < 0:
@@ -253,9 +255,14 @@ fi
 echo "ok fixture on 127.0.0.1:${FIXTURE_PORT}"
 
 # --- startup failures (no listener left behind) ---
-expect_startup_failure missing-token "PUSHOVER_TOKEN must be set" \
+# Blank Pushover values count as unset. The image ships those blanks.
+expect_startup_failure no-backend "At least one notification backend"
+expect_startup_failure blank-pushover "At least one notification backend" \
+  PUSHOVER_TOKEN= \
+  PUSHOVER_USER=
+expect_startup_failure half-token "Both PUSHOVER_TOKEN and PUSHOVER_USER must be set" \
   PUSHOVER_USER=REPLACE_ME
-expect_startup_failure missing-user "PUSHOVER_USER must be set" \
+expect_startup_failure half-user "Both PUSHOVER_TOKEN and PUSHOVER_USER must be set" \
   PUSHOVER_TOKEN=REPLACE_ME
 expect_startup_failure bad-timeout "HEARTBEAT_TIMEOUT_SECS must be a number" \
   PUSHOVER_TOKEN=REPLACE_ME \
@@ -290,7 +297,7 @@ launch_server "$ROUTES_LOG" \
 ROUTES_PID=$LAUNCHED_PID
 wait_for_log "$ROUTES_LOG" "Listening on 0.0.0.0:${ROUTES_PORT}" "$ROUTES_PID"
 wait_for_http "http://127.0.0.1:${ROUTES_PORT}/healthz" "$ROUTES_PID" "$ROUTES_LOG"
-assert_health "$ROUTES_PORT"
+assert_health "$ROUTES_PORT" '["pushover"]'
 
 heartbeat_body=$(curl -fsS --max-time 2 "http://127.0.0.1:${ROUTES_PORT}/heartbeat/poop")
 if [[ "$heartbeat_body" != "OK" ]]; then
@@ -298,7 +305,7 @@ if [[ "$heartbeat_body" != "OK" ]]; then
   die "GET /heartbeat/poop body was '${heartbeat_body}'"
 fi
 echo "ok heartbeat"
-assert_health "$ROUTES_PORT"
+assert_health "$ROUTES_PORT" '["pushover"]'
 
 # Second process on the same port must fail closed.
 expect_startup_failure port-in-use "Address already in use" \
@@ -332,7 +339,7 @@ launch_server "$DELIVERY_LOG" \
   RECOVERY_MESSAGE=RECOVERY_FIXTURE_OK
 DELIVERY_PID=$LAUNCHED_PID
 wait_for_http "http://127.0.0.1:${DELIVERY_PORT}/healthz" "$DELIVERY_PID" "$DELIVERY_LOG"
-assert_health "$DELIVERY_PORT"
+assert_health "$DELIVERY_PORT" '["pushover"]'
 
 delivery_ready=0
 for ((i = 0; i < 75; i++)); do
@@ -395,6 +402,105 @@ if grep -q "api.pushover.net" "$DELIVERY_LOG" "$ROUTES_LOG"; then
 fi
 stop_expect_clean "$DELIVERY_PID" "$DELIVERY_LOG"
 
+# --- ntfy-only: blank Pushover must not block startup; posts stay on the fixture ---
+: >"$FIXTURE_LOG"
+NTFY_PORT=$(free_port)
+NTFY_LOG="${WORKDIR}/ntfy.log"
+launch_server "$NTFY_LOG" \
+  PUSHOVER_TOKEN= \
+  PUSHOVER_USER= \
+  NTFY_TOPIC=solo \
+  NTFY_SERVER="http://127.0.0.1:${FIXTURE_PORT}" \
+  PORT="$NTFY_PORT" \
+  HEARTBEAT_TIMEOUT_SECS=0 \
+  CHECK_INTERVAL_SECS=1 \
+  DEBOUNCE_SECS=3600 \
+  OUTAGE_MESSAGE=OUTAGE_FIXTURE_OK \
+  RECOVERY_MESSAGE=RECOVERY_FIXTURE_OK
+NTFY_PID=$LAUNCHED_PID
+wait_for_http "http://127.0.0.1:${NTFY_PORT}/healthz" "$NTFY_PID" "$NTFY_LOG"
+assert_health "$NTFY_PORT" '["ntfy"]'
+ntfy_ready=0
+for ((i = 0; i < 75; i++)); do
+  if [[ -f "$FIXTURE_LOG" ]] && grep -q "OUTAGE_FIXTURE_OK" "$FIXTURE_LOG"; then
+    ntfy_ready=1
+    break
+  fi
+  if ! kill -0 "$NTFY_PID" 2>/dev/null; then
+    dump_log "$NTFY_LOG"
+    die "ntfy-only process exited before the outage post"
+  fi
+  sleep 0.2
+done
+if [[ "$ntfy_ready" -ne 1 ]]; then
+  dump_log "$NTFY_LOG"
+  dump_log "$FIXTURE_LOG"
+  die "fixture never received the ntfy outage alert"
+fi
+ntfy_beat=$(curl -fsS --max-time 2 "http://127.0.0.1:${NTFY_PORT}/heartbeat/poop")
+if [[ "$ntfy_beat" != "OK" ]]; then
+  dump_log "$NTFY_LOG"
+  die "ntfy-only heartbeat body was '${ntfy_beat}'"
+fi
+python3 - "$FIXTURE_LOG" <<'PY'
+import json
+import sys
+
+rows = []
+with open(sys.argv[1], encoding="utf-8") as handle:
+    for line in handle:
+        line = line.strip()
+        if line:
+            rows.append(json.loads(line))
+if len(rows) != 2:
+    sys.exit(f"expected 2 ntfy posts, got {len(rows)}: {rows}")
+messages = []
+for row in rows:
+    if row.get("path") != "/solo":
+        sys.exit(f"ntfy URL was not selected, path={row.get('path')!r}")
+    messages.append(row.get("body", ""))
+outage = [item for item in messages if item.startswith("OUTAGE_FIXTURE_OK")]
+recovery = [item for item in messages if item == "RECOVERY_FIXTURE_OK"]
+if len(outage) != 1 or len(recovery) != 1:
+    sys.exit(f"expected one ntfy outage and one recovery, got {messages}")
+if "down for " not in outage[0]:
+    sys.exit(f"ntfy outage missing measured downtime: {outage[0]}")
+print("ok ntfy-only delivery", messages)
+PY
+if grep -q "ntfy.sh" "$NTFY_LOG"; then
+  die "ntfy-only log mentioned the public ntfy host"
+fi
+stop_expect_clean "$NTFY_PID" "$NTFY_LOG"
+
+# --- both backends selected, and a healthy process does not notify ---
+: >"$FIXTURE_LOG"
+BOTH_PORT=$(free_port)
+BOTH_LOG="${WORKDIR}/both.log"
+launch_server "$BOTH_LOG" \
+  PUSHOVER_TOKEN=REPLACE_ME \
+  PUSHOVER_USER=REPLACE_ME \
+  PUSHOVER_URL="http://127.0.0.1:${FIXTURE_PORT}/fixture/pushover" \
+  NTFY_TOPIC=combo \
+  NTFY_SERVER="http://127.0.0.1:${FIXTURE_PORT}" \
+  PORT="$BOTH_PORT" \
+  HEARTBEAT_TIMEOUT_SECS=86400 \
+  CHECK_INTERVAL_SECS=3600 \
+  DEBOUNCE_SECS=3600
+BOTH_PID=$LAUNCHED_PID
+wait_for_http "http://127.0.0.1:${BOTH_PORT}/healthz" "$BOTH_PID" "$BOTH_LOG"
+assert_health "$BOTH_PORT" '["pushover","ntfy"]'
+both_beat=$(curl -fsS --max-time 2 "http://127.0.0.1:${BOTH_PORT}/heartbeat/poop")
+if [[ "$both_beat" != "OK" ]]; then
+  dump_log "$BOTH_LOG"
+  die "combined heartbeat body was '${both_beat}'"
+fi
+if [[ -s "$FIXTURE_LOG" ]]; then
+  dump_log "$FIXTURE_LOG"
+  die "combined healthy process sent a notification"
+fi
+echo "ok combined backends"
+stop_expect_clean "$BOTH_PID" "$BOTH_LOG"
+
 # --- failure behavior: a refused local endpoint does not kill the process ---
 FAILURE_PORT=$(free_port)
 FAILURE_LOG="${WORKDIR}/send-failure.log"
@@ -408,12 +514,12 @@ launch_server "$FAILURE_LOG" \
   DEBOUNCE_SECS=3600
 FAILURE_PID=$LAUNCHED_PID
 wait_for_http "http://127.0.0.1:${FAILURE_PORT}/healthz" "$FAILURE_PID" "$FAILURE_LOG"
+assert_health "$FAILURE_PORT" '["pushover"]'
 wait_for_log "$FAILURE_LOG" "Failed to send Pushover" "$FAILURE_PID"
 if ! kill -0 "$FAILURE_PID" 2>/dev/null; then
   dump_log "$FAILURE_LOG"
   die "process exited after a notification send failure"
 fi
-assert_health "$FAILURE_PORT"
 still_ok=$(curl -fsS --max-time 2 "http://127.0.0.1:${FAILURE_PORT}/heartbeat/poop")
 if [[ "$still_ok" != "OK" ]]; then
   dump_log "$FAILURE_LOG"
