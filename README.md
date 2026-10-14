@@ -6,13 +6,14 @@ A Rust-based notification API with Docker deployment and automated versioning.
 - Written in Rust using Actix Web
 - Sends notifications via Pushover
 - Heartbeat watcher with **outage** and **recovery** alerts
+- `GET /healthz` liveness probe (status, uptime, selected backend, heartbeat age)
 - Automated Docker builds and publishing via GitHub Actions
 - Versioning is managed automatically (minor version bump on push)
 - Uses [lefthook](https://github.com/evilmartians/lefthook) for Git hooks
 
 ## Heartbeat outage & recovery
 
-The service exposes `GET /heartbeat/poop`. A background task watches the last heartbeat time:
+The service exposes `GET /healthz` and `GET /heartbeat/poop`. A background task watches the last heartbeat time:
 
 | Event | Condition | Notification |
 |-------|-----------|--------------|
@@ -86,17 +87,30 @@ Now, every time you push, lefthook will bump the minor version and amend your co
 |----------|----------|---------|-------------|
 | `PUSHOVER_TOKEN` | yes | — | Pushover application token |
 | `PUSHOVER_USER` | yes | — | Pushover user/group key |
+| `PUSHOVER_URL` | no | `https://api.pushover.net/1/messages.json` | Pushover endpoint. Point this at a local fixture in tests. |
+| `PORT` | no | `3000` | HTTP listen port |
 | `HEARTBEAT_TIMEOUT_SECS` | no | `90` | Seconds without a heartbeat before outage alert |
 | `CHECK_INTERVAL_SECS` | no | `10` | How often to check staleness while healthy |
 | `DEBOUNCE_SECS` | no | `300` | Wait between repeat outage alerts |
 | `OUTAGE_MESSAGE` | no | `❌ Poop Monitor is offline!` | Pushover text for outage (appended with measured downtime, e.g. `(down for 100s)`) |
 | `RECOVERY_MESSAGE` | no | `✅ Poop Monitor is back online!` | Pushover text when heartbeats resume after outage |
 
+`GET /healthz` returns JSON:
+
+```json
+{"status":"ok","uptime_secs":1,"backends":["pushover"],"last_heartbeat_secs_ago":1}
+```
+
+`backends` is the notification backend the running process selected.
+
 ### Tests
 ```bash
-cargo test
+cargo test --locked
+cargo build --release --locked
+bash scripts/smoke-entrypoint.sh target/release/notification-api
 ```
-Unit tests cover the outage/recovery state machine (recovery only after a prior outage alert).
+
+Unit tests cover the outage/recovery state machine (recovery only after a prior outage alert). `scripts/smoke-entrypoint.sh` starts the shipped binary with synthetic configuration and a local fixture. It checks `/healthz`, `/heartbeat/poop`, Pushover backend selection, startup failures, a refused send, and clean `SIGTERM` shutdown. CI runs that script on `target/release/notification-api` (the binary the Dockerfile copies). The reusable pattern is `docs/smoke-test-pattern.md`. Other repositories track their own adoption.
 
 ## Contributing
 Pull requests are welcome! For major changes, please open an issue first to discuss what you would like to change.

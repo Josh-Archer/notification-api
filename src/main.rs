@@ -1,6 +1,6 @@
 mod monitor;
 
-use actix_web::{get, web, App, HttpServer, Responder};
+use actix_web::{get, web, App, HttpResponse, HttpServer, Responder};
 use dotenv::dotenv;
 use log::{info, warn};
 use monitor::{
@@ -8,8 +8,10 @@ use monitor::{
 };
 use once_cell::sync::Lazy;
 use reqwest::Client;
+use serde::Serialize;
 use std::{
     env,
+    io::Write,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -136,6 +138,33 @@ struct NotifyConfig {
     pushover_url: String,
 }
 
+/// Liveness payload served by the shipped binary.
+///
+/// Field names match the library `HealthResponse` so probes see one shape.
+/// `backends` is the backend this process actually selected.
+#[derive(Serialize)]
+struct HealthBody {
+    status: &'static str,
+    uptime_secs: u64,
+    backends: Vec<&'static str>,
+    last_heartbeat_secs_ago: u64,
+}
+
+/// `PORT` overrides the listen port. Empty or unset keeps the historical default of 3000.
+fn port_from_env() -> u16 {
+    match env::var("PORT") {
+        Ok(value) => {
+            let value = value.trim();
+            if value.is_empty() {
+                3000
+            } else {
+                value.parse().expect("PORT must be a number")
+            }
+        }
+        Err(_) => 3000,
+    }
+}
+
 async fn send_pushover(client: &Client, cfg: &NotifyConfig, message: &str) -> bool {
     let pushover_params = [
         ("token", cfg.token.as_str()),
@@ -161,6 +190,27 @@ async fn send_pushover(client: &Client, cfg: &NotifyConfig, message: &str) -> bo
             false
         }
     }
+}
+
+/// Process liveness for the executable the image runs.
+///
+/// Library tests build a different application factory. This route is registered
+/// on the shipped server so a smoke test of the binary can see backend selection.
+#[get("/healthz")]
+async fn healthz() -> impl Responder {
+    let (uptime_secs, last_heartbeat_secs_ago) = {
+        let mon = MONITOR.lock().unwrap();
+        (
+            mon.epoch.elapsed().as_secs(),
+            mon.last_seen.elapsed().as_secs(),
+        )
+    };
+    HttpResponse::Ok().json(HealthBody {
+        status: "ok",
+        uptime_secs,
+        backends: vec!["pushover"],
+        last_heartbeat_secs_ago,
+    })
 }
 
 #[get("/heartbeat/poop")]
@@ -232,6 +282,10 @@ async fn main() -> std::io::Result<()> {
         .expect("DEBOUNCE_SECS must be a number");
 
     TIMEOUT_SECS.store(timeout_secs, Ordering::Relaxed);
+    // Start the uptime clock with the process, before the first probe.
+    {
+        let _mon = MONITOR.lock().unwrap();
+    }
 
     let notify = NotifyConfig {
         token: pushover_token,
@@ -300,18 +354,23 @@ async fn main() -> std::io::Result<()> {
         }
     });
 
-    // Start HTTP server
+    // Start HTTP server. Print the bound port on stderr (unbuffered enough for
+    // CI to read it) after bind succeeds. `PORT` defaults to 3000.
+    let port = port_from_env();
     let http_client = web::Data::new(client);
     let http_notify = web::Data::new(notify);
-    HttpServer::new(move || {
+    let server = HttpServer::new(move || {
         App::new()
             .app_data(http_client.clone())
             .app_data(http_notify.clone())
+            .service(healthz)
             .service(heartbeat)
     })
-    .bind(("0.0.0.0", 3000))?
-    .run()
-    .await
+    .bind(("0.0.0.0", port))?;
+    eprintln!("Listening on 0.0.0.0:{port}");
+    let _ = std::io::stderr().flush();
+    info!("Listening on 0.0.0.0:{port}");
+    server.run().await
 }
 
 #[cfg(test)]
