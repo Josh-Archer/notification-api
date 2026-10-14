@@ -10,7 +10,7 @@
 
 mod monitor;
 
-use actix_web::{get, web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{get, web, App, HttpResponse, HttpServer};
 use log::{info, warn};
 use monitor::{
     evaluate_check, evaluate_heartbeat, format_outage_message, CheckDecision, HeartbeatDecision,
@@ -182,6 +182,11 @@ fn port_from_env() -> u16 {
         Some(value) => value.parse().expect("PORT must be a number"),
         None => DEFAULT_PORT,
     }
+}
+
+fn heartbeat_secret_from_env() -> Result<String, String> {
+    env_non_empty("HEARTBEAT_SECRET")
+        .ok_or_else(|| "HEARTBEAT_SECRET must be set to protect /heartbeat/poop".into())
 }
 
 /// POST one Pushover message. `true` only when the HTTP status is success.
@@ -407,11 +412,23 @@ pub async fn healthz(
 
 #[get("/heartbeat/poop")]
 async fn heartbeat(
+    request: actix_web::HttpRequest,
     client: web::Data<Client>,
     cfg: web::Data<NotifyConfig>,
     watcher: web::Data<WatcherConfig>,
     monitor: web::Data<Mutex<MonitorState>>,
-) -> impl Responder {
+    secret: web::Data<String>,
+) -> HttpResponse {
+    let expected = format!("Bearer {}", secret.get_ref());
+    let authorized = request
+        .headers()
+        .get(actix_web::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == expected.as_str());
+    if !authorized {
+        return HttpResponse::Unauthorized().finish();
+    }
+
     let (alert, recovery_message) = {
         let mut mon = monitor.lock().unwrap();
         let now = Instant::now();
@@ -447,7 +464,7 @@ async fn heartbeat(
         }
     }
 
-    "OK"
+    HttpResponse::Ok().body("OK")
 }
 
 /// Register the routes the shipped binary serves.
@@ -461,6 +478,7 @@ pub(crate) fn create_app(
     watcher: WatcherConfig,
     monitor: Arc<Mutex<MonitorState>>,
     client: Client,
+    heartbeat_secret: String,
 ) -> App<
     impl actix_web::dev::ServiceFactory<
         actix_web::dev::ServiceRequest,
@@ -476,6 +494,7 @@ pub(crate) fn create_app(
         .app_data(web::Data::new(watcher))
         .app_data(web::Data::from(monitor))
         .app_data(web::Data::new(client))
+        .app_data(web::Data::new(heartbeat_secret))
         .configure(configure_app)
 }
 
@@ -562,6 +581,7 @@ fn spawn_staleness_watcher(
 ///
 /// This is the process the Dockerfile runs.
 pub async fn run(notify: NotifyConfig, watcher: WatcherConfig) -> std::io::Result<()> {
+    let heartbeat_secret = heartbeat_secret_from_env().expect("invalid heartbeat configuration");
     let monitor = Arc::new(Mutex::new(MonitorState::new()));
     let client = Client::new();
     info!(
@@ -583,6 +603,7 @@ pub async fn run(notify: NotifyConfig, watcher: WatcherConfig) -> std::io::Resul
             watcher.clone(),
             Arc::clone(&monitor),
             client.clone(),
+            heartbeat_secret.clone(),
         )
     })
     .bind(("0.0.0.0", port))?
@@ -633,6 +654,7 @@ mod tests {
             "CHECK_INTERVAL_SECS",
             "DEBOUNCE_SECS",
             "PORT",
+            "HEARTBEAT_SECRET",
         ] {
             std::env::remove_var(key);
         }
@@ -787,6 +809,7 @@ mod tests {
                 sample_watcher(),
                 $monitor,
                 test_client(),
+                "REPLACE_ME".into(),
             ))
             .await
         };
@@ -809,6 +832,17 @@ mod tests {
 
         let empty = sample_notify(None, None);
         assert!(empty.backend_names().is_empty());
+    }
+
+    #[test]
+    fn heartbeat_secret_must_be_configured() {
+        let _lock = env_lock();
+        let _clean = EnvGuard::enter();
+        assert!(heartbeat_secret_from_env().is_err());
+        std::env::set_var("HEARTBEAT_SECRET", "REPLACE_ME");
+        assert_eq!(heartbeat_secret_from_env().unwrap(), "REPLACE_ME");
+        std::env::set_var("HEARTBEAT_SECRET", "");
+        assert!(heartbeat_secret_from_env().is_err());
     }
 
     #[test]
@@ -1392,6 +1426,7 @@ mod tests {
             &app,
             aw_test::TestRequest::get()
                 .uri("/heartbeat/poop")
+                .insert_header((actix_web::http::header::AUTHORIZATION, "Bearer REPLACE_ME"))
                 .to_request(),
         )
         .await;
@@ -1407,6 +1442,39 @@ mod tests {
         let fresh_body: HealthResponse = aw_test::read_body_json(fresh).await;
         assert!(fresh_body.last_heartbeat_secs_ago < 5);
         assert_eq!(monitor.lock().unwrap().phase, Phase::Healthy);
+    }
+
+    #[actix_web::test]
+    async fn unauthorized_heartbeat_does_not_refresh_liveness_or_send_recovery() {
+        let mock = spawn_mock().await;
+        let server = format!("http://127.0.0.1:{}", mock.port);
+        let notify = sample_notify(
+            Some(sample_pushover(&format!("{server}/pushover"))),
+            Some(sample_ntfy(&server, "alerts")),
+        );
+        let monitor = Arc::new(Mutex::new(MonitorState::new()));
+        {
+            let mut mon = monitor.lock().unwrap();
+            age_heartbeat(&mut mon, Duration::from_secs(200));
+            mon.phase = Phase::Outage;
+            mon.last_alert = Some(mon.epoch + Duration::from_secs(100));
+        }
+        let last_seen = monitor.lock().unwrap().last_seen;
+        let app = shipped_app!(notify, Arc::clone(&monitor));
+
+        for authorization in [None, Some("Bearer incorrect")] {
+            let mut request = aw_test::TestRequest::get().uri("/heartbeat/poop");
+            if let Some(value) = authorization {
+                request = request.insert_header((actix_web::http::header::AUTHORIZATION, value));
+            }
+            let response = aw_test::call_service(&app, request.to_request()).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        let mon = monitor.lock().unwrap();
+        assert_eq!(mon.last_seen, last_seen);
+        assert_eq!(mon.phase, Phase::Outage);
+        assert!(hits_of(&mock).is_empty());
     }
 
     #[actix_web::test]
@@ -1429,6 +1497,7 @@ mod tests {
             &app,
             aw_test::TestRequest::get()
                 .uri("/heartbeat/poop")
+                .insert_header((actix_web::http::header::AUTHORIZATION, "Bearer REPLACE_ME"))
                 .to_request(),
         )
         .await;
@@ -1454,6 +1523,7 @@ mod tests {
             &app,
             aw_test::TestRequest::get()
                 .uri("/heartbeat/poop")
+                .insert_header((actix_web::http::header::AUTHORIZATION, "Bearer REPLACE_ME"))
                 .to_request(),
         )
         .await;

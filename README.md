@@ -91,6 +91,7 @@ Now, every time you push, lefthook will bump the minor version and amend your co
 | `NTFY_TOPIC` | unless Pushover is set | — | ntfy topic. Enables ntfy, including ntfy-only mode |
 | `NTFY_SERVER` | no | `https://ntfy.sh` | ntfy base URL, no trailing slash required |
 | `NTFY_TOKEN` | no | — | Optional ntfy bearer token |
+| `HEARTBEAT_SECRET` | yes | — | Shared secret required as `Authorization: Bearer <secret>` on `GET /heartbeat/poop` |
 | `HEARTBEAT_TIMEOUT_SECS` | no | `90` | Seconds without a heartbeat before outage alert |
 | `CHECK_INTERVAL_SECS` | no | `10` | How often to check staleness |
 | `DEBOUNCE_SECS` | no | `300` | Minimum gap between repeat outage alerts. Does not reset measured downtime |
@@ -98,7 +99,7 @@ Now, every time you push, lefthook will bump the minor version and amend your co
 | `RECOVERY_MESSAGE` | no | `✅ Poop Monitor is back online!` | Text when heartbeats resume after an outage alert |
 | `PORT` | no | `3000` | HTTP port (`GET /healthz`, `GET /heartbeat/poop`) |
 
-`GET /healthz` returns JSON: `status`, `uptime_secs`, `backends` (`pushover` and/or `ntfy`), and `last_heartbeat_secs_ago`.
+`GET /healthz` returns JSON: `status`, `uptime_secs`, `backends` (`pushover` and/or `ntfy`), and `last_heartbeat_secs_ago`. `GET /heartbeat/poop` requires the `Authorization: Bearer <HEARTBEAT_SECRET>` header; the process exits at startup if `HEARTBEAT_SECRET` is unset or blank.
 
 ### Tests
 ```bash
