@@ -26,7 +26,10 @@ RUN apt-get update && apt-get install -y libssl3 ca-certificates && rm -rf /var/
 # Copy binary from builder
 COPY --from=builder /usr/src/app/target/release/notification-api .
 
-# Set environment variables for secrets (to be injected at runtime)
+# Backend selection is injected at runtime (do not bake secrets into the image).
+# Pushover is enabled only when both PUSHOVER_TOKEN and PUSHOVER_USER are non-empty.
+# ntfy is enabled when NTFY_TOPIC is non-empty (optional NTFY_SERVER, NTFY_TOKEN).
+# Blank Pushover values are ignored so an ntfy-only configuration can start.
 ENV PUSHOVER_TOKEN=""
 ENV PUSHOVER_USER=""
 

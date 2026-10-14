@@ -4,7 +4,8 @@ A Rust-based notification API with Docker deployment and automated versioning.
 
 ## Features
 - Written in Rust using Actix Web
-- Sends notifications via Pushover
+- Sends notifications via Pushover, ntfy, or both
+- `GET /healthz` reports liveness, uptime, enabled backends, and heartbeat age
 - Heartbeat watcher with **outage** and **recovery** alerts
 - Automated Docker builds and publishing via GitHub Actions
 - Versioning is managed automatically (minor version bump on push)
@@ -16,8 +17,8 @@ The service exposes `GET /heartbeat/poop`. A background task watches the last he
 
 | Event | Condition | Notification |
 |-------|-----------|--------------|
-| **Outage** | No heartbeat for longer than `HEARTBEAT_TIMEOUT_SECS` | `OUTAGE_MESSAGE` (with measured downtime, e.g. `(down for 100s)`) |
-| **Recovery** | First heartbeat after an outage alert was sent | `RECOVERY_MESSAGE` |
+| **Outage** | No heartbeat for longer than `HEARTBEAT_TIMEOUT_SECS` | `OUTAGE_MESSAGE` (with measured downtime, e.g. `(down for 100s)`) on every enabled backend |
+| **Recovery** | First heartbeat after an outage alert was sent | `RECOVERY_MESSAGE` on every enabled backend |
 
 Recovery fires **only** after a prior outage alert (not on ordinary heartbeats or startup). While still offline, outage alerts may repeat after `DEBOUNCE_SECS`.
 
@@ -84,19 +85,26 @@ Now, every time you push, lefthook will bump the minor version and amend your co
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `PUSHOVER_TOKEN` | yes | — | Pushover application token |
-| `PUSHOVER_USER` | yes | — | Pushover user/group key |
+| `PUSHOVER_TOKEN` | with `PUSHOVER_USER`, unless ntfy is set | — | Pushover application token. Blank is ignored |
+| `PUSHOVER_USER` | with `PUSHOVER_TOKEN`, unless ntfy is set | — | Pushover user/group key. Blank is ignored |
+| `PUSHOVER_URL` | no | `https://api.pushover.net/1/messages.json` | Pushover messages endpoint |
+| `NTFY_TOPIC` | unless Pushover is set | — | ntfy topic. Enables ntfy, including ntfy-only mode |
+| `NTFY_SERVER` | no | `https://ntfy.sh` | ntfy base URL, no trailing slash required |
+| `NTFY_TOKEN` | no | — | Optional ntfy bearer token |
 | `HEARTBEAT_TIMEOUT_SECS` | no | `90` | Seconds without a heartbeat before outage alert |
-| `CHECK_INTERVAL_SECS` | no | `10` | How often to check staleness while healthy |
-| `DEBOUNCE_SECS` | no | `300` | Wait between repeat outage alerts |
-| `OUTAGE_MESSAGE` | no | `❌ Poop Monitor is offline!` | Pushover text for outage (appended with measured downtime, e.g. `(down for 100s)`) |
-| `RECOVERY_MESSAGE` | no | `✅ Poop Monitor is back online!` | Pushover text when heartbeats resume after outage |
+| `CHECK_INTERVAL_SECS` | no | `10` | How often to check staleness |
+| `DEBOUNCE_SECS` | no | `300` | Minimum gap between repeat outage alerts. Does not reset measured downtime |
+| `OUTAGE_MESSAGE` | no | `❌ Poop Monitor is offline!` | Outage text (appended with measured downtime, e.g. `(down for 100s)`) |
+| `RECOVERY_MESSAGE` | no | `✅ Poop Monitor is back online!` | Text when heartbeats resume after an outage alert |
+| `PORT` | no | `3000` | HTTP port (`GET /healthz`, `GET /heartbeat/poop`) |
+
+`GET /healthz` returns JSON: `status`, `uptime_secs`, `backends` (`pushover` and/or `ntfy`), and `last_heartbeat_secs_ago`.
 
 ### Tests
 ```bash
 cargo test
 ```
-Unit tests cover the outage/recovery state machine (recovery only after a prior outage alert).
+Unit tests cover the outage/recovery state machine (recovery only after a prior outage alert, independent heartbeat and alert timestamps) and Pushover-only, ntfy-only, and combined delivery against synthetic endpoints. `GET /healthz` is exercised on the same application factory the binary serves. Integration tests start that binary, including ntfy-only configuration with blank Pushover variables.
 
 ## Contributing
 Pull requests are welcome! For major changes, please open an issue first to discuss what you would like to change.
