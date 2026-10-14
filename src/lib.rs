@@ -36,6 +36,9 @@ static STARTED_AT_UNIX: Lazy<u64> = Lazy::new(|| {
 const DEFAULT_OUTAGE_MESSAGE: &str = "❌ Poop Monitor is offline!";
 const DEFAULT_RECOVERY_MESSAGE: &str = "✅ Poop Monitor is back online!";
 const DEFAULT_PUSHOVER_URL: &str = "https://api.pushover.net/1/messages.json";
+const DEFAULT_PUSHOVER_RETRY: u64 = 60;
+const DEFAULT_PUSHOVER_EXPIRE: u64 = 3600;
+const MAX_PUSHOVER_EXPIRE: u64 = 10800;
 const DEFAULT_NTFY_SERVER: &str = "https://ntfy.sh";
 const DEFAULT_PORT: u16 = 3000;
 
@@ -48,6 +51,8 @@ pub struct PushoverConfig {
     pub url: String,
     pub title: Option<String>,
     pub priority: Option<i32>,
+    pub retry: u64,
+    pub expire: u64,
     pub sound: Option<String>,
     pub device: Option<String>,
 }
@@ -83,7 +88,8 @@ impl NotifyConfig {
     ///
     /// - Pushover: `PUSHOVER_TOKEN` + `PUSHOVER_USER` (both required to enable).
     ///   Optional `PUSHOVER_URL` (default `https://api.pushover.net/1/messages.json`),
-    ///   `PUSHOVER_TITLE`, `PUSHOVER_PRIORITY`, `PUSHOVER_SOUND`, `PUSHOVER_DEVICE`.
+    ///   `PUSHOVER_TITLE`, `PUSHOVER_PRIORITY`, `PUSHOVER_RETRY`,
+    ///   `PUSHOVER_EXPIRE`, `PUSHOVER_SOUND`, `PUSHOVER_DEVICE`.
     /// - ntfy: `NTFY_TOPIC` (required to enable). Optional `NTFY_SERVER`
     ///   (default `https://ntfy.sh`) and `NTFY_TOKEN`.
     /// - Copy: `OUTAGE_MESSAGE`, `RECOVERY_MESSAGE`.
@@ -95,11 +101,31 @@ impl NotifyConfig {
             (Some(token), Some(user)) => {
                 let priority = match env_non_empty("PUSHOVER_PRIORITY") {
                     Some(val) => match val.parse::<i32>() {
-                        Ok(p) => Some(p),
+                        Ok(p) if (-2..=2).contains(&p) => Some(p),
+                        Ok(_) => return Err("PUSHOVER_PRIORITY must be between -2 and 2".into()),
                         Err(_) => return Err("PUSHOVER_PRIORITY must be a number".into()),
                     },
                     None => None,
                 };
+                let retry = env_non_empty("PUSHOVER_RETRY")
+                    .map(|value| {
+                        value
+                            .parse::<u64>()
+                            .map_err(|_| "PUSHOVER_RETRY must be a number".to_string())
+                    })
+                    .transpose()?
+                    .unwrap_or(DEFAULT_PUSHOVER_RETRY)
+                    .clamp(30, MAX_PUSHOVER_EXPIRE);
+                let expire = env_non_empty("PUSHOVER_EXPIRE")
+                    .map(|value| {
+                        value
+                            .parse::<u64>()
+                            .map_err(|_| "PUSHOVER_EXPIRE must be a number".to_string())
+                    })
+                    .transpose()?
+                    .unwrap_or(DEFAULT_PUSHOVER_EXPIRE)
+                    .clamp(1, MAX_PUSHOVER_EXPIRE)
+                    .max(retry);
                 Some(PushoverConfig {
                     token,
                     user,
@@ -107,6 +133,8 @@ impl NotifyConfig {
                         .unwrap_or_else(|| DEFAULT_PUSHOVER_URL.to_string()),
                     title: env_non_empty("PUSHOVER_TITLE"),
                     priority,
+                    retry,
+                    expire,
                     sound: env_non_empty("PUSHOVER_SOUND"),
                     device: env_non_empty("PUSHOVER_DEVICE"),
                 })
@@ -203,8 +231,10 @@ fn port_from_env() -> u16 {
 }
 
 /// POST one Pushover message. `true` only when the HTTP status is success.
-pub async fn send_pushover(client: &Client, pushover: &PushoverConfig, message: &str) -> bool {
+async fn send_pushover(client: &Client, pushover: &PushoverConfig, message: &str) -> bool {
     let priority_str;
+    let retry_str;
+    let expire_str;
     let mut params = vec![
         ("token", pushover.token.as_str()),
         ("user", pushover.user.as_str()),
@@ -216,6 +246,12 @@ pub async fn send_pushover(client: &Client, pushover: &PushoverConfig, message: 
     if let Some(priority) = pushover.priority {
         priority_str = priority.to_string();
         params.push(("priority", priority_str.as_str()));
+        if priority == 2 {
+            retry_str = pushover.retry.to_string();
+            expire_str = pushover.expire.to_string();
+            params.push(("retry", retry_str.as_str()));
+            params.push(("expire", expire_str.as_str()));
+        }
     }
     if let Some(sound) = &pushover.sound {
         params.push(("sound", sound.as_str()));
@@ -658,6 +694,8 @@ mod tests {
             "PUSHOVER_URL",
             "PUSHOVER_TITLE",
             "PUSHOVER_PRIORITY",
+            "PUSHOVER_RETRY",
+            "PUSHOVER_EXPIRE",
             "PUSHOVER_SOUND",
             "PUSHOVER_DEVICE",
             "NTFY_TOPIC",
@@ -690,6 +728,8 @@ mod tests {
             url: url.into(),
             title: None,
             priority: None,
+            retry: DEFAULT_PUSHOVER_RETRY,
+            expire: DEFAULT_PUSHOVER_EXPIRE,
             sound: None,
             device: None,
         }
@@ -874,6 +914,8 @@ mod tests {
         assert_eq!(pushover.url, "http://127.0.0.1:9/messages.json");
         assert_eq!(pushover.title, None);
         assert_eq!(pushover.priority, None);
+        assert_eq!(pushover.retry, DEFAULT_PUSHOVER_RETRY);
+        assert_eq!(pushover.expire, DEFAULT_PUSHOVER_EXPIRE);
         assert_eq!(pushover.sound, None);
         assert_eq!(pushover.device, None);
         let ntfy = cfg.ntfy.expect("ntfy enabled");
@@ -928,6 +970,56 @@ mod tests {
 
         let err = NotifyConfig::from_env().unwrap_err();
         assert!(err.contains("PUSHOVER_PRIORITY must be a number"));
+    }
+
+    #[test]
+    fn notify_config_from_env_accepts_priority_range_and_rejects_outside() {
+        let _lock = env_lock();
+        let _clean = EnvGuard::enter();
+        std::env::set_var("PUSHOVER_TOKEN", "REPLACE_ME");
+        std::env::set_var("PUSHOVER_USER", "REPLACE_ME");
+
+        for priority in -2..=2 {
+            std::env::set_var("PUSHOVER_PRIORITY", priority.to_string());
+            assert_eq!(
+                NotifyConfig::from_env().unwrap().pushover.unwrap().priority,
+                Some(priority)
+            );
+        }
+        for priority in [-3, 3] {
+            std::env::set_var("PUSHOVER_PRIORITY", priority.to_string());
+            let err = NotifyConfig::from_env().unwrap_err();
+            assert!(err.contains("PUSHOVER_PRIORITY must be between -2 and 2"));
+        }
+    }
+
+    #[test]
+    fn notify_config_from_env_clamps_emergency_retry_and_expire() {
+        let _lock = env_lock();
+        let _clean = EnvGuard::enter();
+        std::env::set_var("PUSHOVER_TOKEN", "REPLACE_ME");
+        std::env::set_var("PUSHOVER_USER", "REPLACE_ME");
+        std::env::set_var("PUSHOVER_RETRY", "10");
+        std::env::set_var("PUSHOVER_EXPIRE", "20000");
+
+        let cfg = NotifyConfig::from_env().unwrap();
+        let pushover = cfg.pushover.unwrap();
+        assert_eq!(pushover.retry, 30);
+        assert_eq!(pushover.expire, MAX_PUSHOVER_EXPIRE);
+
+        std::env::set_var("PUSHOVER_RETRY", "45");
+        std::env::set_var("PUSHOVER_EXPIRE", "1");
+        let cfg = NotifyConfig::from_env().unwrap();
+        let pushover = cfg.pushover.unwrap();
+        assert_eq!(pushover.retry, 45);
+        assert_eq!(pushover.expire, 45);
+
+        std::env::set_var("PUSHOVER_RETRY", "20000");
+        std::env::set_var("PUSHOVER_EXPIRE", "20000");
+        let cfg = NotifyConfig::from_env().unwrap();
+        let pushover = cfg.pushover.unwrap();
+        assert_eq!(pushover.retry, MAX_PUSHOVER_EXPIRE);
+        assert_eq!(pushover.expire, MAX_PUSHOVER_EXPIRE);
     }
 
     #[test]
@@ -1315,6 +1407,37 @@ mod tests {
         assert!(hits[0].body.contains("sound=quiet"));
         assert!(!hits[0].body.contains("title="));
         assert!(!hits[0].body.contains("device="));
+        assert!(!hits[0].body.contains("retry="));
+        assert!(!hits[0].body.contains("expire="));
+    }
+
+    #[actix_web::test]
+    async fn send_pushover_emergency_includes_default_retry_and_expire() {
+        let mock = spawn_mock().await;
+        let mut cfg = sample_pushover(&format!("http://127.0.0.1:{}/pushover", mock.port));
+        cfg.priority = Some(2);
+
+        assert!(send_pushover(&test_client(), &cfg, "urgent message").await);
+        let hits = hits_of(&mock);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].body.contains("priority=2"));
+        assert!(hits[0].body.contains("retry=60"));
+        assert!(hits[0].body.contains("expire=3600"));
+    }
+
+    #[actix_web::test]
+    async fn send_pushover_emergency_includes_custom_retry_and_expire() {
+        let mock = spawn_mock().await;
+        let mut cfg = sample_pushover(&format!("http://127.0.0.1:{}/pushover", mock.port));
+        cfg.priority = Some(2);
+        cfg.retry = 30;
+        cfg.expire = MAX_PUSHOVER_EXPIRE;
+
+        assert!(send_pushover(&test_client(), &cfg, "urgent message").await);
+        let hits = hits_of(&mock);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].body.contains("retry=30"));
+        assert!(hits[0].body.contains("expire=10800"));
     }
 
     #[actix_web::test]
