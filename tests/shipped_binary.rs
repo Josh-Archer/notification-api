@@ -16,6 +16,7 @@ const CONFIG_KEYS: &[&str] = &[
     "NTFY_TOPIC",
     "NTFY_SERVER",
     "NTFY_TOKEN",
+    "HEARTBEAT_SECRET",
     "OUTAGE_MESSAGE",
     "RECOVERY_MESSAGE",
     "HEARTBEAT_TIMEOUT_SECS",
@@ -113,7 +114,7 @@ fn try_exit(child: &mut Child) -> Option<ExitStatus> {
     child.try_wait().expect("try_wait")
 }
 
-fn http_get(port: u16, path: &str) -> (u16, String) {
+fn http_get_with_auth(port: u16, path: &str, authorization: Option<&str>) -> (u16, String) {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
@@ -121,7 +122,12 @@ fn http_get(port: u16, path: &str) -> (u16, String) {
     stream
         .set_write_timeout(Some(Duration::from_secs(2)))
         .expect("write timeout");
-    let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    let authorization = authorization
+        .map(|value| format!("Authorization: {value}\r\n"))
+        .unwrap_or_default();
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{authorization}Connection: close\r\n\r\n"
+    );
     stream.write_all(request.as_bytes()).expect("write request");
     let mut raw = String::new();
     stream.read_to_string(&mut raw).expect("read response");
@@ -136,6 +142,10 @@ fn http_get(port: u16, path: &str) -> (u16, String) {
         .parse()
         .unwrap_or_else(|_| panic!("status code in {status_line}"));
     (code, body.to_string())
+}
+
+fn http_get(port: u16, path: &str) -> (u16, String) {
+    http_get_with_auth(port, path, None)
 }
 
 fn wait_http(running: &mut Running, port: u16, path: &str) -> (u16, String) {
@@ -162,6 +172,7 @@ fn wait_http(running: &mut Running, port: u16, path: &str) -> (u16, String) {
 fn base_env(port: u16) -> Vec<(&'static str, String)> {
     vec![
         ("PORT", port.to_string()),
+        ("HEARTBEAT_SECRET", "REPLACE_ME".into()),
         ("CHECK_INTERVAL_SECS", "3600".into()),
         ("HEARTBEAT_TIMEOUT_SECS", "86400".into()),
         ("DEBOUNCE_SECS", "3600".into()),
@@ -192,7 +203,8 @@ fn shipped_binary_starts_ntfy_only_and_serves_healthz() {
         "health payload: {body}"
     );
 
-    let (beat_code, beat_body) = http_get(port, "/heartbeat/poop");
+    let (beat_code, beat_body) =
+        http_get_with_auth(port, "/heartbeat/poop", Some("Bearer REPLACE_ME"));
     assert_eq!(beat_code, 200, "{beat_body}");
     assert_eq!(beat_body, "OK");
 }
