@@ -10,7 +10,7 @@
 
 mod monitor;
 
-use actix_web::{get, web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{get, web, App, HttpResponse, HttpServer};
 use log::{info, warn};
 use monitor::{
     evaluate_check, evaluate_heartbeat, format_outage_message, CheckDecision, HeartbeatDecision,
@@ -23,6 +23,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use subtle::ConstantTimeEq;
 use tokio::{spawn, time};
 
 /// Process start time (unix seconds) for health reporting.
@@ -36,6 +37,9 @@ static STARTED_AT_UNIX: Lazy<u64> = Lazy::new(|| {
 const DEFAULT_OUTAGE_MESSAGE: &str = "❌ Poop Monitor is offline!";
 const DEFAULT_RECOVERY_MESSAGE: &str = "✅ Poop Monitor is back online!";
 const DEFAULT_PUSHOVER_URL: &str = "https://api.pushover.net/1/messages.json";
+const DEFAULT_PUSHOVER_RETRY: u64 = 60;
+const DEFAULT_PUSHOVER_EXPIRE: u64 = 3600;
+const MAX_PUSHOVER_EXPIRE: u64 = 10800;
 const DEFAULT_NTFY_SERVER: &str = "https://ntfy.sh";
 const DEFAULT_PORT: u16 = 3000;
 
@@ -46,6 +50,12 @@ pub struct PushoverConfig {
     pub user: String,
     /// Full messages URL. Defaults to the public Pushover API.
     pub url: String,
+    pub title: Option<String>,
+    pub priority: Option<i32>,
+    pub retry: u64,
+    pub expire: u64,
+    pub sound: Option<String>,
+    pub device: Option<String>,
 }
 
 /// ntfy topic / server settings.
@@ -78,7 +88,9 @@ impl NotifyConfig {
     /// `PUSHOVER_*` defaults and still start on ntfy alone.
     ///
     /// - Pushover: `PUSHOVER_TOKEN` + `PUSHOVER_USER` (both required to enable).
-    ///   Optional `PUSHOVER_URL` (default `https://api.pushover.net/1/messages.json`).
+    ///   Optional `PUSHOVER_URL` (default `https://api.pushover.net/1/messages.json`),
+    ///   `PUSHOVER_TITLE`, `PUSHOVER_PRIORITY`, `PUSHOVER_RETRY`,
+    ///   `PUSHOVER_EXPIRE`, `PUSHOVER_SOUND`, `PUSHOVER_DEVICE`.
     /// - ntfy: `NTFY_TOPIC` (required to enable). Optional `NTFY_SERVER`
     ///   (default `https://ntfy.sh`) and `NTFY_TOKEN`.
     /// - Copy: `OUTAGE_MESSAGE`, `RECOVERY_MESSAGE`.
@@ -87,12 +99,47 @@ impl NotifyConfig {
             env_non_empty("PUSHOVER_TOKEN"),
             env_non_empty("PUSHOVER_USER"),
         ) {
-            (Some(token), Some(user)) => Some(PushoverConfig {
-                token,
-                user,
-                url: env_non_empty("PUSHOVER_URL")
-                    .unwrap_or_else(|| DEFAULT_PUSHOVER_URL.to_string()),
-            }),
+            (Some(token), Some(user)) => {
+                let priority = match env_non_empty("PUSHOVER_PRIORITY") {
+                    Some(val) => match val.parse::<i32>() {
+                        Ok(p) if (-2..=2).contains(&p) => Some(p),
+                        Ok(_) => return Err("PUSHOVER_PRIORITY must be between -2 and 2".into()),
+                        Err(_) => return Err("PUSHOVER_PRIORITY must be a number".into()),
+                    },
+                    None => None,
+                };
+                let retry = env_non_empty("PUSHOVER_RETRY")
+                    .map(|value| {
+                        value
+                            .parse::<u64>()
+                            .map_err(|_| "PUSHOVER_RETRY must be a number".to_string())
+                    })
+                    .transpose()?
+                    .unwrap_or(DEFAULT_PUSHOVER_RETRY)
+                    .clamp(30, MAX_PUSHOVER_EXPIRE);
+                let expire = env_non_empty("PUSHOVER_EXPIRE")
+                    .map(|value| {
+                        value
+                            .parse::<u64>()
+                            .map_err(|_| "PUSHOVER_EXPIRE must be a number".to_string())
+                    })
+                    .transpose()?
+                    .unwrap_or(DEFAULT_PUSHOVER_EXPIRE)
+                    .clamp(1, MAX_PUSHOVER_EXPIRE)
+                    .max(retry);
+                Some(PushoverConfig {
+                    token,
+                    user,
+                    url: env_non_empty("PUSHOVER_URL")
+                        .unwrap_or_else(|| DEFAULT_PUSHOVER_URL.to_string()),
+                    title: env_non_empty("PUSHOVER_TITLE"),
+                    priority,
+                    retry,
+                    expire,
+                    sound: env_non_empty("PUSHOVER_SOUND"),
+                    device: env_non_empty("PUSHOVER_DEVICE"),
+                })
+            }
             (None, None) => None,
             _ => {
                 return Err(
@@ -184,13 +231,43 @@ fn port_from_env() -> u16 {
     }
 }
 
+fn heartbeat_secret_from_env() -> Result<String, String> {
+    env::var("HEARTBEAT_SECRET")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "HEARTBEAT_SECRET must be set to protect /heartbeat/poop".into())
+}
+
 /// POST one Pushover message. `true` only when the HTTP status is success.
 async fn send_pushover(client: &Client, pushover: &PushoverConfig, message: &str) -> bool {
-    let params = [
+    let priority_str;
+    let retry_str;
+    let expire_str;
+    let mut params = vec![
         ("token", pushover.token.as_str()),
         ("user", pushover.user.as_str()),
         ("message", message),
     ];
+    if let Some(title) = &pushover.title {
+        params.push(("title", title.as_str()));
+    }
+    if let Some(priority) = pushover.priority {
+        priority_str = priority.to_string();
+        params.push(("priority", priority_str.as_str()));
+        if priority == 2 {
+            retry_str = pushover.retry.to_string();
+            expire_str = pushover.expire.to_string();
+            params.push(("retry", retry_str.as_str()));
+            params.push(("expire", expire_str.as_str()));
+        }
+    }
+    if let Some(sound) = &pushover.sound {
+        params.push(("sound", sound.as_str()));
+    }
+    if let Some(device) = &pushover.device {
+        params.push(("device", device.as_str()));
+    }
     match client.post(&pushover.url).form(&params).send().await {
         Ok(response) => {
             let status = response.status();
@@ -407,11 +484,23 @@ pub async fn healthz(
 
 #[get("/heartbeat/poop")]
 async fn heartbeat(
+    request: actix_web::HttpRequest,
     client: web::Data<Client>,
     cfg: web::Data<NotifyConfig>,
     watcher: web::Data<WatcherConfig>,
     monitor: web::Data<Mutex<MonitorState>>,
-) -> impl Responder {
+    secret: web::Data<String>,
+) -> HttpResponse {
+    let authorized = request
+        .headers()
+        .get(actix_web::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|token| bool::from(token.as_bytes().ct_eq(secret.as_bytes())));
+    if !authorized {
+        return HttpResponse::Unauthorized().finish();
+    }
+
     let (alert, recovery_message) = {
         let mut mon = monitor.lock().unwrap();
         let now = Instant::now();
@@ -447,7 +536,7 @@ async fn heartbeat(
         }
     }
 
-    "OK"
+    HttpResponse::Ok().body("OK")
 }
 
 /// Register the routes the shipped binary serves.
@@ -461,6 +550,7 @@ pub(crate) fn create_app(
     watcher: WatcherConfig,
     monitor: Arc<Mutex<MonitorState>>,
     client: Client,
+    heartbeat_secret: String,
 ) -> App<
     impl actix_web::dev::ServiceFactory<
         actix_web::dev::ServiceRequest,
@@ -476,6 +566,7 @@ pub(crate) fn create_app(
         .app_data(web::Data::new(watcher))
         .app_data(web::Data::from(monitor))
         .app_data(web::Data::new(client))
+        .app_data(web::Data::new(heartbeat_secret))
         .configure(configure_app)
 }
 
@@ -562,6 +653,7 @@ fn spawn_staleness_watcher(
 ///
 /// This is the process the Dockerfile runs.
 pub async fn run(notify: NotifyConfig, watcher: WatcherConfig) -> std::io::Result<()> {
+    let heartbeat_secret = heartbeat_secret_from_env().expect("invalid heartbeat configuration");
     let monitor = Arc::new(Mutex::new(MonitorState::new()));
     let client = Client::new();
     info!(
@@ -583,6 +675,7 @@ pub async fn run(notify: NotifyConfig, watcher: WatcherConfig) -> std::io::Resul
             watcher.clone(),
             Arc::clone(&monitor),
             client.clone(),
+            heartbeat_secret.clone(),
         )
     })
     .bind(("0.0.0.0", port))?
@@ -624,6 +717,12 @@ mod tests {
             "PUSHOVER_TOKEN",
             "PUSHOVER_USER",
             "PUSHOVER_URL",
+            "PUSHOVER_TITLE",
+            "PUSHOVER_PRIORITY",
+            "PUSHOVER_RETRY",
+            "PUSHOVER_EXPIRE",
+            "PUSHOVER_SOUND",
+            "PUSHOVER_DEVICE",
             "NTFY_TOPIC",
             "NTFY_SERVER",
             "NTFY_TOKEN",
@@ -633,6 +732,7 @@ mod tests {
             "CHECK_INTERVAL_SECS",
             "DEBOUNCE_SECS",
             "PORT",
+            "HEARTBEAT_SECRET",
         ] {
             std::env::remove_var(key);
         }
@@ -652,6 +752,12 @@ mod tests {
             token: "REPLACE_ME".into(),
             user: "REPLACE_ME".into(),
             url: url.into(),
+            title: None,
+            priority: None,
+            retry: DEFAULT_PUSHOVER_RETRY,
+            expire: DEFAULT_PUSHOVER_EXPIRE,
+            sound: None,
+            device: None,
         }
     }
 
@@ -787,6 +893,17 @@ mod tests {
                 sample_watcher(),
                 $monitor,
                 test_client(),
+                "REPLACE_ME".into(),
+            ))
+            .await
+        };
+        ($notify:expr, $monitor:expr, $secret:expr) => {
+            aw_test::init_service(create_app(
+                $notify,
+                sample_watcher(),
+                $monitor,
+                test_client(),
+                $secret.into(),
             ))
             .await
         };
@@ -812,6 +929,21 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_secret_must_be_configured() {
+        let _lock = env_lock();
+        let _clean = EnvGuard::enter();
+        assert!(heartbeat_secret_from_env().is_err());
+        std::env::set_var("HEARTBEAT_SECRET", "REPLACE_ME");
+        assert_eq!(heartbeat_secret_from_env().unwrap(), "REPLACE_ME");
+        std::env::set_var("HEARTBEAT_SECRET", "  trimmed-secret \t\n");
+        assert_eq!(heartbeat_secret_from_env().unwrap(), "trimmed-secret");
+        std::env::set_var("HEARTBEAT_SECRET", "");
+        assert!(heartbeat_secret_from_env().is_err());
+        std::env::set_var("HEARTBEAT_SECRET", " \t\n ");
+        assert!(heartbeat_secret_from_env().is_err());
+    }
+
+    #[test]
     fn notify_config_from_env_pushover_and_ntfy() {
         let _lock = env_lock();
         let _clean = EnvGuard::enter();
@@ -832,10 +964,114 @@ mod tests {
         assert_eq!(pushover.token, "REPLACE_ME");
         assert_eq!(pushover.user, "REPLACE_ME");
         assert_eq!(pushover.url, "http://127.0.0.1:9/messages.json");
+        assert_eq!(pushover.title, None);
+        assert_eq!(pushover.priority, None);
+        assert_eq!(pushover.retry, DEFAULT_PUSHOVER_RETRY);
+        assert_eq!(pushover.expire, DEFAULT_PUSHOVER_EXPIRE);
+        assert_eq!(pushover.sound, None);
+        assert_eq!(pushover.device, None);
         let ntfy = cfg.ntfy.expect("ntfy enabled");
         assert_eq!(ntfy.topic, "mytopic");
         assert_eq!(ntfy.server, "https://ntfy.example.com");
         assert_eq!(ntfy.token.as_deref(), Some("REPLACE_ME"));
+    }
+
+    #[test]
+    fn notify_config_from_env_pushover_optional_fields() {
+        let _lock = env_lock();
+        let _clean = EnvGuard::enter();
+        std::env::set_var("PUSHOVER_TOKEN", "REPLACE_ME");
+        std::env::set_var("PUSHOVER_USER", "REPLACE_ME");
+        std::env::set_var("PUSHOVER_TITLE", "Custom Title");
+        std::env::set_var("PUSHOVER_PRIORITY", "1");
+        std::env::set_var("PUSHOVER_SOUND", "cosmic");
+        std::env::set_var("PUSHOVER_DEVICE", "myphone");
+
+        let cfg = NotifyConfig::from_env().expect("should load");
+        let pushover = cfg.pushover.expect("pushover enabled");
+        assert_eq!(pushover.title.as_deref(), Some("Custom Title"));
+        assert_eq!(pushover.priority, Some(1));
+        assert_eq!(pushover.sound.as_deref(), Some("cosmic"));
+        assert_eq!(pushover.device.as_deref(), Some("myphone"));
+
+        // Verify negative priority works as well
+        std::env::set_var("PUSHOVER_PRIORITY", "-1");
+        let cfg_neg = NotifyConfig::from_env().expect("should load negative priority");
+        assert_eq!(cfg_neg.pushover.unwrap().priority, Some(-1));
+
+        // Verify blank values are treated as unset
+        std::env::set_var("PUSHOVER_TITLE", "");
+        std::env::set_var("PUSHOVER_PRIORITY", "");
+        std::env::set_var("PUSHOVER_SOUND", "");
+        std::env::set_var("PUSHOVER_DEVICE", "");
+        let cfg_blank = NotifyConfig::from_env().expect("should load blank optional fields");
+        let p_blank = cfg_blank.pushover.unwrap();
+        assert_eq!(p_blank.title, None);
+        assert_eq!(p_blank.priority, None);
+        assert_eq!(p_blank.sound, None);
+        assert_eq!(p_blank.device, None);
+    }
+
+    #[test]
+    fn notify_config_from_env_pushover_rejects_invalid_priority() {
+        let _lock = env_lock();
+        let _clean = EnvGuard::enter();
+        std::env::set_var("PUSHOVER_TOKEN", "REPLACE_ME");
+        std::env::set_var("PUSHOVER_USER", "REPLACE_ME");
+        std::env::set_var("PUSHOVER_PRIORITY", "not-a-number");
+
+        let err = NotifyConfig::from_env().unwrap_err();
+        assert!(err.contains("PUSHOVER_PRIORITY must be a number"));
+    }
+
+    #[test]
+    fn notify_config_from_env_accepts_priority_range_and_rejects_outside() {
+        let _lock = env_lock();
+        let _clean = EnvGuard::enter();
+        std::env::set_var("PUSHOVER_TOKEN", "REPLACE_ME");
+        std::env::set_var("PUSHOVER_USER", "REPLACE_ME");
+
+        for priority in -2..=2 {
+            std::env::set_var("PUSHOVER_PRIORITY", priority.to_string());
+            assert_eq!(
+                NotifyConfig::from_env().unwrap().pushover.unwrap().priority,
+                Some(priority)
+            );
+        }
+        for priority in [-3, 3] {
+            std::env::set_var("PUSHOVER_PRIORITY", priority.to_string());
+            let err = NotifyConfig::from_env().unwrap_err();
+            assert!(err.contains("PUSHOVER_PRIORITY must be between -2 and 2"));
+        }
+    }
+
+    #[test]
+    fn notify_config_from_env_clamps_emergency_retry_and_expire() {
+        let _lock = env_lock();
+        let _clean = EnvGuard::enter();
+        std::env::set_var("PUSHOVER_TOKEN", "REPLACE_ME");
+        std::env::set_var("PUSHOVER_USER", "REPLACE_ME");
+        std::env::set_var("PUSHOVER_RETRY", "10");
+        std::env::set_var("PUSHOVER_EXPIRE", "20000");
+
+        let cfg = NotifyConfig::from_env().unwrap();
+        let pushover = cfg.pushover.unwrap();
+        assert_eq!(pushover.retry, 30);
+        assert_eq!(pushover.expire, MAX_PUSHOVER_EXPIRE);
+
+        std::env::set_var("PUSHOVER_RETRY", "45");
+        std::env::set_var("PUSHOVER_EXPIRE", "1");
+        let cfg = NotifyConfig::from_env().unwrap();
+        let pushover = cfg.pushover.unwrap();
+        assert_eq!(pushover.retry, 45);
+        assert_eq!(pushover.expire, 45);
+
+        std::env::set_var("PUSHOVER_RETRY", "20000");
+        std::env::set_var("PUSHOVER_EXPIRE", "20000");
+        let cfg = NotifyConfig::from_env().unwrap();
+        let pushover = cfg.pushover.unwrap();
+        assert_eq!(pushover.retry, MAX_PUSHOVER_EXPIRE);
+        assert_eq!(pushover.expire, MAX_PUSHOVER_EXPIRE);
     }
 
     #[test]
@@ -1159,6 +1395,124 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn send_pushover_posts_all_optional_fields_when_present() {
+        let mock = spawn_mock().await;
+        let mut cfg = sample_pushover(&format!("http://127.0.0.1:{}/pushover", mock.port));
+        cfg.title = Some("Poop Alert".into());
+        cfg.priority = Some(1);
+        cfg.sound = Some("siren".into());
+        cfg.device = Some("pixel-8".into());
+
+        let client = test_client();
+        let ok = send_pushover(&client, &cfg, "warning message").await;
+        assert!(ok);
+
+        let hits = hits_of(&mock);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "/pushover");
+        assert!(hits[0].body.contains("token=REPLACE_ME"));
+        assert!(hits[0].body.contains("user=REPLACE_ME"));
+        let decoded = decoded_body(&hits[0].body);
+        assert!(decoded.contains("message=warning message"));
+        assert!(decoded.contains("title=Poop Alert"));
+        assert!(hits[0].body.contains("priority=1"));
+        assert!(hits[0].body.contains("sound=siren"));
+        assert!(hits[0].body.contains("device=pixel-8"));
+    }
+
+    #[actix_web::test]
+    async fn send_pushover_omits_optional_fields_when_none() {
+        let mock = spawn_mock().await;
+        let cfg = sample_pushover(&format!("http://127.0.0.1:{}/pushover", mock.port));
+
+        let client = test_client();
+        let ok = send_pushover(&client, &cfg, "plain message").await;
+        assert!(ok);
+
+        let hits = hits_of(&mock);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "/pushover");
+        assert!(hits[0].body.contains("token=REPLACE_ME"));
+        assert!(hits[0].body.contains("user=REPLACE_ME"));
+        let decoded = decoded_body(&hits[0].body);
+        assert!(decoded.contains("message=plain message"));
+        assert!(!hits[0].body.contains("title="));
+        assert!(!hits[0].body.contains("priority="));
+        assert!(!hits[0].body.contains("sound="));
+        assert!(!hits[0].body.contains("device="));
+    }
+
+    #[actix_web::test]
+    async fn send_pushover_posts_subset_of_optional_fields() {
+        let mock = spawn_mock().await;
+        let mut cfg = sample_pushover(&format!("http://127.0.0.1:{}/pushover", mock.port));
+        cfg.priority = Some(-1);
+        cfg.sound = Some("quiet".into());
+
+        let client = test_client();
+        let ok = send_pushover(&client, &cfg, "quiet message").await;
+        assert!(ok);
+
+        let hits = hits_of(&mock);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].body.contains("priority=-1"));
+        assert!(hits[0].body.contains("sound=quiet"));
+        assert!(!hits[0].body.contains("title="));
+        assert!(!hits[0].body.contains("device="));
+        assert!(!hits[0].body.contains("retry="));
+        assert!(!hits[0].body.contains("expire="));
+    }
+
+    #[actix_web::test]
+    async fn send_pushover_emergency_includes_default_retry_and_expire() {
+        let mock = spawn_mock().await;
+        let mut cfg = sample_pushover(&format!("http://127.0.0.1:{}/pushover", mock.port));
+        cfg.priority = Some(2);
+
+        assert!(send_pushover(&test_client(), &cfg, "urgent message").await);
+        let hits = hits_of(&mock);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].body.contains("priority=2"));
+        assert!(hits[0].body.contains("retry=60"));
+        assert!(hits[0].body.contains("expire=3600"));
+    }
+
+    #[actix_web::test]
+    async fn send_pushover_emergency_includes_custom_retry_and_expire() {
+        let mock = spawn_mock().await;
+        let mut cfg = sample_pushover(&format!("http://127.0.0.1:{}/pushover", mock.port));
+        cfg.priority = Some(2);
+        cfg.retry = 30;
+        cfg.expire = MAX_PUSHOVER_EXPIRE;
+
+        assert!(send_pushover(&test_client(), &cfg, "urgent message").await);
+        let hits = hits_of(&mock);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].body.contains("retry=30"));
+        assert!(hits[0].body.contains("expire=10800"));
+    }
+
+    #[actix_web::test]
+    async fn send_alert_pushover_with_optional_fields() {
+        let mock = spawn_mock().await;
+        let mut pushover = sample_pushover(&format!("http://127.0.0.1:{}/pushover", mock.port));
+        pushover.title = Some("Outage".into());
+        pushover.priority = Some(1);
+        pushover.sound = Some("falling".into());
+        pushover.device = Some("nexus".into());
+        let notify = sample_notify(Some(pushover), None);
+
+        let ok = send_alert(&test_client(), &notify, "synthetic-alert").await;
+        assert!(ok);
+        let hits = hits_of(&mock);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].body.contains("title=Outage"));
+        assert!(hits[0].body.contains("priority=1"));
+        assert!(hits[0].body.contains("sound=falling"));
+        assert!(hits[0].body.contains("device=nexus"));
+    }
+
+    #[actix_web::test]
     async fn send_alert_reaches_pushover_only_synthetic_endpoint() {
         let mock = spawn_mock().await;
         let notify = sample_notify(
@@ -1392,6 +1746,7 @@ mod tests {
             &app,
             aw_test::TestRequest::get()
                 .uri("/heartbeat/poop")
+                .insert_header((actix_web::http::header::AUTHORIZATION, "Bearer REPLACE_ME"))
                 .to_request(),
         )
         .await;
@@ -1407,6 +1762,60 @@ mod tests {
         let fresh_body: HealthResponse = aw_test::read_body_json(fresh).await;
         assert!(fresh_body.last_heartbeat_secs_ago < 5);
         assert_eq!(monitor.lock().unwrap().phase, Phase::Healthy);
+    }
+
+    #[actix_web::test]
+    async fn unauthorized_heartbeat_does_not_refresh_liveness_or_send_recovery() {
+        let mock = spawn_mock().await;
+        let server = format!("http://127.0.0.1:{}", mock.port);
+        let notify = sample_notify(
+            Some(sample_pushover(&format!("{server}/pushover"))),
+            Some(sample_ntfy(&server, "alerts")),
+        );
+        let monitor = Arc::new(Mutex::new(MonitorState::new()));
+        {
+            let mut mon = monitor.lock().unwrap();
+            age_heartbeat(&mut mon, Duration::from_secs(200));
+            mon.phase = Phase::Outage;
+            mon.last_alert = Some(mon.epoch + Duration::from_secs(100));
+        }
+        let last_seen = monitor.lock().unwrap().last_seen;
+        let app = shipped_app!(notify, Arc::clone(&monitor));
+
+        for authorization in [None, Some("Bearer xxxxxxxxxx"), Some("Bearer short")] {
+            let mut request = aw_test::TestRequest::get().uri("/heartbeat/poop");
+            if let Some(value) = authorization {
+                request = request.insert_header((actix_web::http::header::AUTHORIZATION, value));
+            }
+            let response = aw_test::call_service(&app, request.to_request()).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        let mon = monitor.lock().unwrap();
+        assert_eq!(mon.last_seen, last_seen);
+        assert_eq!(mon.phase, Phase::Outage);
+        assert!(hits_of(&mock).is_empty());
+    }
+
+    #[actix_web::test]
+    async fn heartbeat_accepts_correct_secret() {
+        let notify = sample_notify(None, None);
+        let monitor = Arc::new(Mutex::new(MonitorState::new()));
+        let app = shipped_app!(notify, monitor, "trimmed-secret");
+
+        let response = aw_test::call_service(
+            &app,
+            aw_test::TestRequest::get()
+                .uri("/heartbeat/poop")
+                .insert_header((
+                    actix_web::http::header::AUTHORIZATION,
+                    "Bearer trimmed-secret",
+                ))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[actix_web::test]
@@ -1429,6 +1838,7 @@ mod tests {
             &app,
             aw_test::TestRequest::get()
                 .uri("/heartbeat/poop")
+                .insert_header((actix_web::http::header::AUTHORIZATION, "Bearer REPLACE_ME"))
                 .to_request(),
         )
         .await;
@@ -1454,6 +1864,7 @@ mod tests {
             &app,
             aw_test::TestRequest::get()
                 .uri("/heartbeat/poop")
+                .insert_header((actix_web::http::header::AUTHORIZATION, "Bearer REPLACE_ME"))
                 .to_request(),
         )
         .await;

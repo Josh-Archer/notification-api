@@ -13,9 +13,14 @@ const CONFIG_KEYS: &[&str] = &[
     "PUSHOVER_TOKEN",
     "PUSHOVER_USER",
     "PUSHOVER_URL",
+    "PUSHOVER_TITLE",
+    "PUSHOVER_PRIORITY",
+    "PUSHOVER_SOUND",
+    "PUSHOVER_DEVICE",
     "NTFY_TOPIC",
     "NTFY_SERVER",
     "NTFY_TOKEN",
+    "HEARTBEAT_SECRET",
     "OUTAGE_MESSAGE",
     "RECOVERY_MESSAGE",
     "HEARTBEAT_TIMEOUT_SECS",
@@ -113,7 +118,7 @@ fn try_exit(child: &mut Child) -> Option<ExitStatus> {
     child.try_wait().expect("try_wait")
 }
 
-fn http_get(port: u16, path: &str) -> (u16, String) {
+fn http_get_with_auth(port: u16, path: &str, authorization: Option<&str>) -> (u16, String) {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
@@ -121,7 +126,12 @@ fn http_get(port: u16, path: &str) -> (u16, String) {
     stream
         .set_write_timeout(Some(Duration::from_secs(2)))
         .expect("write timeout");
-    let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    let authorization = authorization
+        .map(|value| format!("Authorization: {value}\r\n"))
+        .unwrap_or_default();
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{authorization}Connection: close\r\n\r\n"
+    );
     stream.write_all(request.as_bytes()).expect("write request");
     let mut raw = String::new();
     stream.read_to_string(&mut raw).expect("read response");
@@ -136,6 +146,10 @@ fn http_get(port: u16, path: &str) -> (u16, String) {
         .parse()
         .unwrap_or_else(|_| panic!("status code in {status_line}"));
     (code, body.to_string())
+}
+
+fn http_get(port: u16, path: &str) -> (u16, String) {
+    http_get_with_auth(port, path, None)
 }
 
 fn wait_http(running: &mut Running, port: u16, path: &str) -> (u16, String) {
@@ -162,6 +176,7 @@ fn wait_http(running: &mut Running, port: u16, path: &str) -> (u16, String) {
 fn base_env(port: u16) -> Vec<(&'static str, String)> {
     vec![
         ("PORT", port.to_string()),
+        ("HEARTBEAT_SECRET", "REPLACE_ME".into()),
         ("CHECK_INTERVAL_SECS", "3600".into()),
         ("HEARTBEAT_TIMEOUT_SECS", "86400".into()),
         ("DEBOUNCE_SECS", "3600".into()),
@@ -192,7 +207,8 @@ fn shipped_binary_starts_ntfy_only_and_serves_healthz() {
         "health payload: {body}"
     );
 
-    let (beat_code, beat_body) = http_get(port, "/heartbeat/poop");
+    let (beat_code, beat_body) =
+        http_get_with_auth(port, "/heartbeat/poop", Some("Bearer REPLACE_ME"));
     assert_eq!(beat_code, 200, "{beat_body}");
     assert_eq!(beat_body, "OK");
 }
@@ -248,6 +264,58 @@ fn shipped_binary_exits_when_no_backend_is_configured() {
     );
     assert!(
         stderr.contains("At least one notification backend"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn shipped_binary_starts_with_optional_pushover_settings() {
+    let port = free_port();
+    let mut env = base_env(port);
+    env.push(("PUSHOVER_TOKEN", "REPLACE_ME".into()));
+    env.push(("PUSHOVER_USER", "REPLACE_ME".into()));
+    env.push(("PUSHOVER_TITLE", "Monitor".into()));
+    env.push(("PUSHOVER_PRIORITY", "1".into()));
+    env.push(("PUSHOVER_SOUND", "cosmic".into()));
+    env.push(("PUSHOVER_DEVICE", "pixel".into()));
+    let owned: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let mut running = spawn_binary(&owned);
+
+    let (code, body) = wait_http(&mut running, port, "/healthz");
+    assert_eq!(code, 200, "GET /healthz body: {body}");
+    assert!(
+        body.contains("\"backends\":[\"pushover\"]"),
+        "health payload: {body}"
+    );
+}
+
+#[test]
+fn shipped_binary_exits_when_pushover_priority_is_invalid() {
+    let port = free_port();
+    let mut env = base_env(port);
+    env.push(("PUSHOVER_TOKEN", "REPLACE_ME".into()));
+    env.push(("PUSHOVER_USER", "REPLACE_ME".into()));
+    env.push(("PUSHOVER_PRIORITY", "invalid-number".into()));
+    let owned: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let mut running = spawn_binary(&owned);
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = try_exit(&mut running.child) {
+            break status;
+        }
+        if Instant::now() > deadline {
+            panic!("binary kept running with invalid priority");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    let stderr = running.stderr_text();
+    assert!(
+        !status.success(),
+        "expected non-zero exit, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("PUSHOVER_PRIORITY must be a number"),
         "stderr: {stderr}"
     );
 }

@@ -44,7 +44,13 @@ Recovery fires **only** after a prior outage alert (not on ordinary heartbeats o
    ```
 
 ### Docker
-Build and run the Docker container:
+The maintained prebuilt image is published to GHCR:
+```bash
+docker pull ghcr.io/josh-archer/notification-api:latest
+docker run --env-file .env ghcr.io/josh-archer/notification-api:latest
+```
+
+For a local build:
 ```bash
 docker build -t notification-api .
 docker run --env-file .env notification-api
@@ -73,12 +79,11 @@ Now, every time you push, lefthook will bump the minor version and amend your co
 - On every push to `main` (and via `workflow_dispatch`), the workflow:
   - Tags the commit with the current Cargo.toml version (if missing)
   - Builds a multi-arch image (`linux/amd64`, `linux/arm64`)
-  - Always pushes to GHCR: `ghcr.io/josh-archer/notification-api:{version,latest}`
-  - Also pushes to Docker Hub when `DOCKER_USERNAME` / `DOCKER_PASSWORD` are valid
+  - Publishes version and `latest` tags to GHCR: `ghcr.io/josh-archer/notification-api`
+- **GHCR is the permanent and only supported publication registry.** The workflow does not publish to Docker Hub and does not require Docker Hub credentials. Existing Docker Hub copies, if any, are legacy and will not receive updates; consumers should use the GHCR image above.
 - Pull requests and pushes to `main` also run `.github/workflows/ci.yml`, which tests and smoke-starts the release binary. That job does not publish an image.
 - Required secrets:
-  - `PUSHOVER_TOKEN`, `PUSHOVER_USER` (app runtime/config used by the publish workflow)
-  - Optional: `DOCKER_USERNAME`, `DOCKER_PASSWORD` — use a Docker Hub **Access Token** (Read & Write) as the password. Account passwords are rejected and will skip Docker Hub without failing the GHCR publish.
+  - `PUSHOVER_TOKEN`, `PUSHOVER_USER` (app runtime/config used by CI env)
 
 ### Environment Variables
 - Sensitive values (e.g., `PUSHOVER_TOKEN`, `PUSHOVER_USER`) should be set as GitHub secrets or environment variables, not in `.env`.
@@ -89,9 +94,16 @@ Now, every time you push, lefthook will bump the minor version and amend your co
 | `PUSHOVER_TOKEN` | with `PUSHOVER_USER`, unless ntfy is set | — | Pushover application token. Blank is ignored |
 | `PUSHOVER_USER` | with `PUSHOVER_TOKEN`, unless ntfy is set | — | Pushover user/group key. Blank is ignored |
 | `PUSHOVER_URL` | no | `https://api.pushover.net/1/messages.json` | Pushover messages endpoint. Point this at a local fixture in tests. |
+| `PUSHOVER_TITLE` | no | — | Optional Pushover notification title |
+| `PUSHOVER_PRIORITY` | no | — | Optional Pushover notification priority (-2 to 2); values outside this range fail startup |
+| `PUSHOVER_RETRY` | no | `60` | Emergency priority retry interval in seconds; sent only with priority `2` and clamped to `30..=10800` |
+| `PUSHOVER_EXPIRE` | no | `3600` | Emergency priority expiration in seconds; sent only with priority `2`, capped at `10800` and raised to at least retry |
+| `PUSHOVER_SOUND` | no | — | Optional Pushover notification sound |
+| `PUSHOVER_DEVICE` | no | — | Optional Pushover device name |
 | `NTFY_TOPIC` | unless Pushover is set | — | ntfy topic. Enables ntfy, including ntfy-only mode |
 | `NTFY_SERVER` | no | `https://ntfy.sh` | ntfy base URL, no trailing slash required |
 | `NTFY_TOKEN` | no | — | Optional ntfy bearer token |
+| `HEARTBEAT_SECRET` | yes | — | Shared secret required as `Authorization: Bearer <secret>` on `GET /heartbeat/poop` |
 | `HEARTBEAT_TIMEOUT_SECS` | no | `90` | Seconds without a heartbeat before outage alert |
 | `CHECK_INTERVAL_SECS` | no | `10` | How often to check staleness |
 | `DEBOUNCE_SECS` | no | `300` | Minimum gap between repeat outage alerts. Does not reset measured downtime |
@@ -99,7 +111,7 @@ Now, every time you push, lefthook will bump the minor version and amend your co
 | `RECOVERY_MESSAGE` | no | `✅ Poop Monitor is back online!` | Text when heartbeats resume after an outage alert |
 | `PORT` | no | `3000` | HTTP port (`GET /healthz`, `GET /heartbeat/poop`) |
 
-`GET /healthz` returns JSON: `status`, `uptime_secs`, `backends` (`pushover` and/or `ntfy`), and `last_heartbeat_secs_ago`.
+`GET /healthz` returns JSON: `status`, `uptime_secs`, `backends` (`pushover` and/or `ntfy`), and `last_heartbeat_secs_ago`. `GET /heartbeat/poop` requires the `Authorization: Bearer <HEARTBEAT_SECRET>` header; the process exits at startup if `HEARTBEAT_SECRET` is unset or blank.
 
 ### Tests
 ```bash

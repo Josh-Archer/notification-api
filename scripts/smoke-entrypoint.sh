@@ -96,8 +96,10 @@ launch_server() {
     -u NTFY_TOPIC \
     -u NTFY_SERVER \
     -u NTFY_TOKEN \
+    -u HEARTBEAT_SECRET \
     -u RUST_LOG \
     RUST_LOG=info \
+    HEARTBEAT_SECRET="$HEARTBEAT_SECRET_VALUE" \
     "$@" \
     "$BIN" >"$log" 2>&1 &
   LAUNCHED_PID=$!
@@ -123,7 +125,9 @@ expect_startup_failure() {
     -u NTFY_TOPIC \
     -u NTFY_SERVER \
     -u NTFY_TOKEN \
+    -u HEARTBEAT_SECRET \
     RUST_LOG=info \
+    HEARTBEAT_SECRET="$HEARTBEAT_SECRET_VALUE" \
     "$@" \
     "$BIN" >"$log" 2>&1
   local code=$?
@@ -211,7 +215,7 @@ assert_health() {
   local port=$1
   local expected_backends=$2
   local body
-  if ! body=$(curl -fsS --max-time 2 "http://127.0.0.1:${port}/healthz"); then
+  if ! body=$(curl -fsS --max-time 2 -H "Authorization: Bearer ${HEARTBEAT_SECRET_VALUE}" "http://127.0.0.1:${port}/healthz"); then
     die "GET /healthz failed"
   fi
   BODY="$body" EXPECTED_BACKENDS="$expected_backends" python3 - <<'PY'
@@ -234,6 +238,8 @@ PY
 
 echo "smoke binary: ${BIN}"
 
+# GET /heartbeat/poop requires a shared bearer secret (#29).
+HEARTBEAT_SECRET_VALUE=REPLACE_ME_SMOKE_SECRET
 FIXTURE_PORT=$(free_port)
 python3 "$FIXTURE_PY" "$FIXTURE_PORT" "$FIXTURE_LOG" >"${WORKDIR}/fixture.stdout" 2>"${WORKDIR}/fixture.stderr" &
 FIXTURE_PID=$!
@@ -276,6 +282,10 @@ expect_startup_failure bad-debounce "DEBOUNCE_SECS must be a number" \
   PUSHOVER_TOKEN=REPLACE_ME \
   PUSHOVER_USER=REPLACE_ME \
   DEBOUNCE_SECS=nope
+expect_startup_failure no-heartbeat-secret "HEARTBEAT_SECRET must be set" \
+  PUSHOVER_TOKEN=REPLACE_ME \
+  PUSHOVER_USER=REPLACE_ME \
+  HEARTBEAT_SECRET=
 expect_startup_failure bad-port "PORT must be a number" \
   PUSHOVER_TOKEN=REPLACE_ME \
   PUSHOVER_USER=REPLACE_ME \
@@ -299,12 +309,18 @@ wait_for_log "$ROUTES_LOG" "Listening on 0.0.0.0:${ROUTES_PORT}" "$ROUTES_PID"
 wait_for_http "http://127.0.0.1:${ROUTES_PORT}/healthz" "$ROUTES_PID" "$ROUTES_LOG"
 assert_health "$ROUTES_PORT" '["pushover"]'
 
-heartbeat_body=$(curl -fsS --max-time 2 "http://127.0.0.1:${ROUTES_PORT}/heartbeat/poop")
+heartbeat_body=$(curl -fsS --max-time 2 -H "Authorization: Bearer ${HEARTBEAT_SECRET_VALUE}" "http://127.0.0.1:${ROUTES_PORT}/heartbeat/poop")
 if [[ "$heartbeat_body" != "OK" ]]; then
   dump_log "$ROUTES_LOG"
   die "GET /heartbeat/poop body was '${heartbeat_body}'"
 fi
 echo "ok heartbeat"
+unauth_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:${ROUTES_PORT}/heartbeat/poop")
+if [[ "$unauth_code" != "401" ]]; then
+  dump_log "$ROUTES_LOG"
+  die "GET /heartbeat/poop without the secret returned ${unauth_code}, expected 401"
+fi
+echo "ok heartbeat rejects missing secret"
 assert_health "$ROUTES_PORT" '["pushover"]'
 
 # Second process on the same port must fail closed.
@@ -359,7 +375,7 @@ if [[ "$delivery_ready" -ne 1 ]]; then
   die "fixture never received the outage alert"
 fi
 
-recovery_body=$(curl -fsS --max-time 2 "http://127.0.0.1:${DELIVERY_PORT}/heartbeat/poop")
+recovery_body=$(curl -fsS --max-time 2 -H "Authorization: Bearer ${HEARTBEAT_SECRET_VALUE}" "http://127.0.0.1:${DELIVERY_PORT}/heartbeat/poop")
 if [[ "$recovery_body" != "OK" ]]; then
   dump_log "$DELIVERY_LOG"
   die "recovery heartbeat body was '${recovery_body}'"
@@ -437,7 +453,7 @@ if [[ "$ntfy_ready" -ne 1 ]]; then
   dump_log "$FIXTURE_LOG"
   die "fixture never received the ntfy outage alert"
 fi
-ntfy_beat=$(curl -fsS --max-time 2 "http://127.0.0.1:${NTFY_PORT}/heartbeat/poop")
+ntfy_beat=$(curl -fsS --max-time 2 -H "Authorization: Bearer ${HEARTBEAT_SECRET_VALUE}" "http://127.0.0.1:${NTFY_PORT}/heartbeat/poop")
 if [[ "$ntfy_beat" != "OK" ]]; then
   dump_log "$NTFY_LOG"
   die "ntfy-only heartbeat body was '${ntfy_beat}'"
@@ -489,7 +505,7 @@ launch_server "$BOTH_LOG" \
 BOTH_PID=$LAUNCHED_PID
 wait_for_http "http://127.0.0.1:${BOTH_PORT}/healthz" "$BOTH_PID" "$BOTH_LOG"
 assert_health "$BOTH_PORT" '["pushover","ntfy"]'
-both_beat=$(curl -fsS --max-time 2 "http://127.0.0.1:${BOTH_PORT}/heartbeat/poop")
+both_beat=$(curl -fsS --max-time 2 -H "Authorization: Bearer ${HEARTBEAT_SECRET_VALUE}" "http://127.0.0.1:${BOTH_PORT}/heartbeat/poop")
 if [[ "$both_beat" != "OK" ]]; then
   dump_log "$BOTH_LOG"
   die "combined heartbeat body was '${both_beat}'"
@@ -520,7 +536,7 @@ if ! kill -0 "$FAILURE_PID" 2>/dev/null; then
   dump_log "$FAILURE_LOG"
   die "process exited after a notification send failure"
 fi
-still_ok=$(curl -fsS --max-time 2 "http://127.0.0.1:${FAILURE_PORT}/heartbeat/poop")
+still_ok=$(curl -fsS --max-time 2 -H "Authorization: Bearer ${HEARTBEAT_SECRET_VALUE}" "http://127.0.0.1:${FAILURE_PORT}/heartbeat/poop")
 if [[ "$still_ok" != "OK" ]]; then
   dump_log "$FAILURE_LOG"
   die "heartbeat failed after a notification send failure"
