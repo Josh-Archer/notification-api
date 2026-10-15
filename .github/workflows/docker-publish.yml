@@ -54,40 +54,23 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Secondary registry: optional. Wrong/expired DOCKER_* secrets must not block GHCR publish.
-      - name: Log in to Docker Hub
-        id: dockerhub_login
-        continue-on-error: true
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
-
+      # GHCR is the sole supported publication registry.
       - name: Resolve image tags
         id: meta
         env:
-          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
           VERSION: ${{ steps.cargo-version.outputs.version }}
-          DOCKERHUB_OUTCOME: ${{ steps.dockerhub_login.outcome }}
         run: |
           set -euo pipefail
-          OWNER_LC="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          OWNER_LC="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
           GHCR_IMAGE="ghcr.io/${OWNER_LC}/notification-api"
           TAGS="${GHCR_IMAGE}:${VERSION}"$'\n'"${GHCR_IMAGE}:latest"
-          if [ "${DOCKERHUB_OUTCOME}" = "success" ] && [ -n "${DOCKER_USERNAME:-}" ]; then
-            TAGS="${TAGS}"$'\n'"${DOCKER_USERNAME}/notification-api:${VERSION}"$'\n'"${DOCKER_USERNAME}/notification-api:latest"
-            echo "dockerhub=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "dockerhub=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::Docker Hub login failed or DOCKER_USERNAME/DOCKER_PASSWORD missing/invalid. Publishing multi-arch image to GHCR only (${GHCR_IMAGE}). Fix repo secrets: DOCKER_USERNAME (Docker Hub username) and DOCKER_PASSWORD (Docker Hub Access Token with Read & Write, not the account password)."
-          fi
           {
             echo "tags<<EOF"
             printf '%s\n' "$TAGS"
             echo "EOF"
             echo "ghcr_image=${GHCR_IMAGE}"
           } >> "$GITHUB_OUTPUT"
-          echo "Resolved tags:"
+          echo "Resolved GHCR tags:"
           printf '%s\n' "$TAGS"
 
       # Multi-stage Dockerfile builds the Rust binary inside the image for each platform.
@@ -103,14 +86,10 @@ jobs:
             PUSHOVER_TOKEN=${{ secrets.PUSHOVER_TOKEN }}
             PUSHOVER_USER=${{ secrets.PUSHOVER_USER }}
 
-      - name: Summarize publish targets
+      - name: Summarize publish target
+        env:
+          VERSION: ${{ steps.cargo-version.outputs.version }}
+          GHCR_IMAGE: ${{ steps.meta.outputs.ghcr_image }}
         run: |
-          echo "### Publish summary" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Version: \`${{ steps.cargo-version.outputs.version }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Platforms: \`linux/amd64,linux/arm64\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- GHCR: \`${{ steps.meta.outputs.ghcr_image }}\`" >> "$GITHUB_STEP_SUMMARY"
-          if [ "${{ steps.meta.outputs.dockerhub }}" = "true" ]; then
-            echo "- Docker Hub: published" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "- Docker Hub: **skipped** (update DOCKER_USERNAME / DOCKER_PASSWORD — use an Access Token)" >> "$GITHUB_STEP_SUMMARY"
-          fi
+          printf '### Publish summary\n- Version: %s\n- Platforms: linux/amd64,linux/arm64\n- Canonical registry: %s (GHCR only)\n' \
+            "$VERSION" "$GHCR_IMAGE" >> "$GITHUB_STEP_SUMMARY"
