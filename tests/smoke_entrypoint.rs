@@ -14,7 +14,7 @@ fn smoke_shipped_entrypoint() {
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/smoke-entrypoint.sh");
     let output = Command::new("bash")
         .arg(script)
-        .arg(&bin)
+        .arg(bin)
         .output()
         .expect("spawn smoke-entrypoint.sh");
     if !output.status.success() {
