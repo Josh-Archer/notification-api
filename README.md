@@ -81,6 +81,7 @@ Now, every time you push, lefthook will bump the minor version and amend your co
   - Builds a multi-arch image (`linux/amd64`, `linux/arm64`)
   - Publishes version and `latest` tags to GHCR: `ghcr.io/josh-archer/notification-api`
 - **GHCR is the permanent and only supported publication registry.** The workflow does not publish to Docker Hub and does not require Docker Hub credentials. Existing Docker Hub copies, if any, are legacy and will not receive updates; consumers should use the GHCR image above.
+- Pull requests and pushes to `main` also run `.github/workflows/ci.yml`, which tests and smoke-starts the release binary. That job does not publish an image.
 - Required secrets:
   - `PUSHOVER_TOKEN`, `PUSHOVER_USER` (app runtime/config used by CI env)
 
@@ -92,7 +93,7 @@ Now, every time you push, lefthook will bump the minor version and amend your co
 |----------|----------|---------|-------------|
 | `PUSHOVER_TOKEN` | with `PUSHOVER_USER`, unless ntfy is set | — | Pushover application token. Blank is ignored |
 | `PUSHOVER_USER` | with `PUSHOVER_TOKEN`, unless ntfy is set | — | Pushover user/group key. Blank is ignored |
-| `PUSHOVER_URL` | no | `https://api.pushover.net/1/messages.json` | Pushover messages endpoint |
+| `PUSHOVER_URL` | no | `https://api.pushover.net/1/messages.json` | Pushover messages endpoint. Point this at a local fixture in tests. |
 | `PUSHOVER_TITLE` | no | — | Optional Pushover notification title |
 | `PUSHOVER_PRIORITY` | no | — | Optional Pushover notification priority (-2 to 2); values outside this range fail startup |
 | `PUSHOVER_RETRY` | no | `60` | Emergency priority retry interval in seconds; sent only with priority `2` and clamped to `30..=10800` |
@@ -114,13 +115,17 @@ Now, every time you push, lefthook will bump the minor version and amend your co
 
 ### Tests
 ```bash
-cargo test
+cargo test --locked
+cargo build --release --locked
+bash scripts/smoke-entrypoint.sh target/release/notification-api
 ```
-Unit tests cover the outage/recovery state machine (recovery only after a prior outage alert, independent heartbeat and alert timestamps) and Pushover-only, ntfy-only, and combined delivery against synthetic endpoints. `GET /healthz` is exercised on the same application factory the binary serves. Integration tests start that binary, including ntfy-only configuration with blank Pushover variables.
+
+Unit tests cover the outage/recovery state machine (recovery only after a prior outage alert, independent heartbeat and alert timestamps) and Pushover-only, ntfy-only, and combined delivery against synthetic endpoints. `GET /healthz` is exercised on the same application factory the binary serves.
+
+`scripts/smoke-entrypoint.sh` starts the shipped binary (the file the Dockerfile copies) with synthetic configuration and a local fixture. It checks `/healthz`, `/heartbeat/poop`, Pushover-only, ntfy-only, and combined backend selection, startup failures, a refused send, and clean `SIGTERM` shutdown. CI runs that script on `target/release/notification-api`. The reusable pattern is `docs/smoke-test-pattern.md`. Other repositories track their own adoption.
 
 ## Contributing
 Pull requests are welcome! For major changes, please open an issue first to discuss what you would like to change.
 
 ## License
 MIT
-

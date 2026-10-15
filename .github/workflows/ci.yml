@@ -1,0 +1,36 @@
+name: CI
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  test-and-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Same compiler major as the image builder (Dockerfile rust:1.88).
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.88
+
+      - name: Unit and entrypoint tests
+        run: cargo test --locked
+
+      - name: Build shipped binary
+        run: cargo build --release --locked
+
+      # The Dockerfile copies target/release/notification-api into the image.
+      # Smoke that file with a local fixture. No registry push and no live calls.
+      - name: Smoke-test shipped entrypoint
+        run: |
+          set -euo pipefail
+          grep -q 'target/release/notification-api' Dockerfile
+          bash scripts/smoke-entrypoint.sh target/release/notification-api
