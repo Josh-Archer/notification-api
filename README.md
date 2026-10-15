@@ -44,7 +44,13 @@ Recovery fires **only** after a prior outage alert (not on ordinary heartbeats o
    ```
 
 ### Docker
-Build and run the Docker container:
+The maintained prebuilt image is published to GHCR:
+```bash
+docker pull ghcr.io/josh-archer/notification-api:latest
+docker run --env-file .env ghcr.io/josh-archer/notification-api:latest
+```
+
+For a local build:
 ```bash
 docker build -t notification-api .
 docker run --env-file .env notification-api
@@ -73,11 +79,10 @@ Now, every time you push, lefthook will bump the minor version and amend your co
 - On every push to `main` (and via `workflow_dispatch`), the workflow:
   - Tags the commit with the current Cargo.toml version (if missing)
   - Builds a multi-arch image (`linux/amd64`, `linux/arm64`)
-  - Always pushes to GHCR: `ghcr.io/josh-archer/notification-api:{version,latest}`
-  - Also pushes to Docker Hub when `DOCKER_USERNAME` / `DOCKER_PASSWORD` are valid
+  - Publishes version and `latest` tags to GHCR: `ghcr.io/josh-archer/notification-api`
+- **GHCR is the permanent and only supported publication registry.** The workflow does not publish to Docker Hub and does not require Docker Hub credentials. Existing Docker Hub copies, if any, are legacy and will not receive updates; consumers should use the GHCR image above.
 - Required secrets:
   - `PUSHOVER_TOKEN`, `PUSHOVER_USER` (app runtime/config used by CI env)
-  - Optional: `DOCKER_USERNAME`, `DOCKER_PASSWORD` — use a Docker Hub **Access Token** (Read & Write) as the password. Account passwords are rejected and will skip Docker Hub without failing the GHCR publish.
 
 ### Environment Variables
 - Sensitive values (e.g., `PUSHOVER_TOKEN`, `PUSHOVER_USER`) should be set as GitHub secrets or environment variables, not in `.env`.
