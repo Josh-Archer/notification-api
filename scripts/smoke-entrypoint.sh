@@ -97,6 +97,12 @@ launch_server() {
     -u NTFY_SERVER \
     -u NTFY_TOKEN \
     -u HEARTBEAT_SECRET \
+    -u MONITORS_JSON \
+    -u MONITOR_BACKUP_SECRET \
+    -u MONITOR_BACKUP_TIMEOUT_SECS \
+    -u MONITOR_BACKUP_OUTAGE_MESSAGE \
+    -u MONITOR_BACKUP_RECOVERY_MESSAGE \
+    -u MONITOR_CRON_TIMEOUT_SECS \
     -u RUST_LOG \
     RUST_LOG=info \
     HEARTBEAT_SECRET="$HEARTBEAT_SECRET_VALUE" \
@@ -286,6 +292,14 @@ expect_startup_failure no-heartbeat-secret "HEARTBEAT_SECRET must be set" \
   PUSHOVER_TOKEN=REPLACE_ME \
   PUSHOVER_USER=REPLACE_ME \
   HEARTBEAT_SECRET=
+expect_startup_failure bad-monitor-timeout "MONITOR_BACKUP_TIMEOUT_SECS must be a number" \
+  PUSHOVER_TOKEN=REPLACE_ME \
+  PUSHOVER_USER=REPLACE_ME \
+  MONITOR_BACKUP_TIMEOUT_SECS=nope
+expect_startup_failure bad-monitors-json "MONITORS_JSON must be an object" \
+  PUSHOVER_TOKEN=REPLACE_ME \
+  PUSHOVER_USER=REPLACE_ME \
+  MONITORS_JSON=not-json
 expect_startup_failure bad-port "PORT must be a number" \
   PUSHOVER_TOKEN=REPLACE_ME \
   PUSHOVER_USER=REPLACE_ME \
@@ -543,5 +557,106 @@ if [[ "$still_ok" != "OK" ]]; then
 fi
 echo "ok send failure kept the process up"
 stop_expect_clean "$FAILURE_PID" "$FAILURE_LOG"
+
+# --- multiple named monitors: second monitor, per-monitor secret, 404, /fail ---
+: >"$FIXTURE_LOG"
+MULTI_PORT=$(free_port)
+MULTI_LOG="${WORKDIR}/multi.log"
+BACKUP_SECRET_VALUE=REPLACE_ME_BACKUP_SECRET
+launch_server "$MULTI_LOG" \
+  PUSHOVER_TOKEN=REPLACE_ME \
+  PUSHOVER_USER=REPLACE_ME \
+  PUSHOVER_URL="http://127.0.0.1:${FIXTURE_PORT}/fixture/pushover" \
+  PORT="$MULTI_PORT" \
+  HEARTBEAT_TIMEOUT_SECS=86400 \
+  CHECK_INTERVAL_SECS=3600 \
+  DEBOUNCE_SECS=3600 \
+  MONITORS_JSON='{"cron":{"timeout_secs":86400}}' \
+  MONITOR_BACKUP_SECRET="$BACKUP_SECRET_VALUE" \
+  MONITOR_BACKUP_TIMEOUT_SECS=86400 \
+  MONITOR_BACKUP_OUTAGE_MESSAGE=BACKUP_FAIL_FIXTURE \
+  MONITOR_BACKUP_RECOVERY_MESSAGE=BACKUP_RECOVERY_FIXTURE
+MULTI_PID=$LAUNCHED_PID
+wait_for_http "http://127.0.0.1:${MULTI_PORT}/healthz" "$MULTI_PID" "$MULTI_LOG"
+
+http_code() {
+  # usage: http_code METHOD PATH [SECRET] [BODY]
+  local method=$1 path=$2 secret=${3:-} body=${4:-}
+  local args=(-s -o /dev/null -w '%{http_code}' --max-time 2 -X "$method")
+  if [[ -n "$secret" ]]; then
+    args+=(-H "Authorization: Bearer ${secret}")
+  fi
+  if [[ -n "$body" ]]; then
+    args+=(--data "$body")
+  fi
+  curl "${args[@]}" "http://127.0.0.1:${MULTI_PORT}${path}"
+}
+expect_code() {
+  local want=$1
+  shift
+  local got
+  got=$(http_code "$@")
+  if [[ "$got" != "$want" ]]; then
+    dump_log "$MULTI_LOG"
+    die "$* returned ${got}, expected ${want}"
+  fi
+}
+
+expect_code 200 GET /heartbeat/poop "$HEARTBEAT_SECRET_VALUE"
+expect_code 200 GET /heartbeat/backup "$BACKUP_SECRET_VALUE"
+expect_code 200 POST /heartbeat/backup "$BACKUP_SECRET_VALUE"
+expect_code 200 GET /heartbeat/cron "$HEARTBEAT_SECRET_VALUE"
+expect_code 401 GET /heartbeat/backup "$HEARTBEAT_SECRET_VALUE"
+expect_code 401 GET /heartbeat/poop "$BACKUP_SECRET_VALUE"
+expect_code 401 GET /heartbeat/backup
+expect_code 404 GET /heartbeat/unknown "$HEARTBEAT_SECRET_VALUE"
+expect_code 404 POST /heartbeat/unknown/fail "$HEARTBEAT_SECRET_VALUE"
+echo "ok two monitors, per-monitor secret, unknown name 404"
+
+curl -fsS --max-time 2 "http://127.0.0.1:${MULTI_PORT}/healthz" | python3 -c '
+import json, sys
+body = json.load(sys.stdin)
+monitors = body.get("monitors", {})
+if sorted(monitors) != ["backup", "cron", "poop"]:
+    sys.exit(f"monitors: {body}")
+for name, entry in monitors.items():
+    if entry.get("status") != "ok" or not isinstance(entry.get("last_seen_secs_ago"), int):
+        sys.exit(f"monitor {name}: {entry}")
+print("ok healthz monitors", json.dumps(monitors, separators=(",", ":")))
+'
+if [[ -s "$FIXTURE_LOG" ]]; then
+  dump_log "$FIXTURE_LOG"
+  die "healthy monitors sent a notification"
+fi
+
+# Unauthorized and unknown /fail must not alert.
+expect_code 401 POST /heartbeat/backup/fail "$HEARTBEAT_SECRET_VALUE"
+if [[ -s "$FIXTURE_LOG" ]]; then
+  die "rejected /fail sent a notification"
+fi
+# /fail alerts immediately: configured message, then a custom body.
+expect_code 200 GET /heartbeat/backup/fail "$BACKUP_SECRET_VALUE"
+expect_code 200 POST /heartbeat/backup/fail "$BACKUP_SECRET_VALUE" "pg_dump exited 2"
+# The next success ping on that monitor recovers it.
+expect_code 200 GET /heartbeat/backup "$BACKUP_SECRET_VALUE"
+
+python3 - "$FIXTURE_LOG" <<'PY'
+import json
+import sys
+from urllib.parse import parse_qs
+
+messages = []
+with open(sys.argv[1], encoding="utf-8") as handle:
+    for line in handle:
+        line = line.strip()
+        if line:
+            form = parse_qs(json.loads(line)["body"], keep_blank_values=True)
+            messages.append(form.get("message", [""])[0])
+expected = ["BACKUP_FAIL_FIXTURE", "pg_dump exited 2", "BACKUP_RECOVERY_FIXTURE"]
+if messages != expected:
+    sys.exit(f"fail path messages {messages}, expected {expected}")
+print("ok fail signal and recovery", messages)
+PY
+stop_expect_clean "$MULTI_PID" "$MULTI_LOG"
 
 echo "smoke-entrypoint: ok"

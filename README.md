@@ -5,22 +5,41 @@ A Rust-based notification API with Docker deployment and automated versioning.
 ## Features
 - Written in Rust using Actix Web
 - Sends notifications via Pushover, ntfy, or both
-- `GET /healthz` reports liveness, uptime, enabled backends, and heartbeat age
-- Heartbeat watcher with **outage** and **recovery** alerts
+- `GET /healthz` reports liveness, uptime, enabled backends, and per-monitor heartbeat age and status
+- Multiple named heartbeat monitors, each with its own timeout, messages, and optional secret
+- Heartbeat watcher with **outage** and **recovery** alerts, plus an explicit `/fail` signal
 - Automated Docker builds and publishing via GitHub Actions
 - Versioning is managed automatically (minor version bump on push)
 - Uses [lefthook](https://github.com/evilmartians/lefthook) for Git hooks
 
 ## Heartbeat outage & recovery
 
-The service exposes `GET /heartbeat/poop`. A background task watches the last heartbeat time:
+The service exposes `GET|POST /heartbeat/{name}` for each configured monitor; `/heartbeat/poop` is the default monitor. A background task watches each monitor's last heartbeat time:
 
 | Event | Condition | Notification |
 |-------|-----------|--------------|
-| **Outage** | No heartbeat for longer than `HEARTBEAT_TIMEOUT_SECS` | `OUTAGE_MESSAGE` (with measured downtime, e.g. `(down for 100s)`) on every enabled backend |
+| **Outage** | No heartbeat for longer than the monitor's timeout (`HEARTBEAT_TIMEOUT_SECS` for `poop`) |
+| **Outage (explicit)** | `GET|POST /heartbeat/{name}/fail` | The request body if non-empty (trimmed, max 500 chars), otherwise the monitor's outage message, sent immediately | `OUTAGE_MESSAGE` (with measured downtime, e.g. `(down for 100s)`) on every enabled backend |
 | **Recovery** | First heartbeat after an outage alert was sent | `RECOVERY_MESSAGE` on every enabled backend |
 
 Recovery fires **only** after a prior outage alert (not on ordinary heartbeats or startup). While still offline, outage alerts may repeat after `DEBOUNCE_SECS`.
+
+### Named monitors
+
+The `poop` monitor always exists and takes its settings from `HEARTBEAT_TIMEOUT_SECS`, `DEBOUNCE_SECS`, `OUTAGE_MESSAGE` and `RECOVERY_MESSAGE`, so existing deployments behave exactly as before. Add more monitors with `MONITORS_JSON` and/or `MONITOR_<NAME>_*` variables:
+
+```bash
+MONITORS_JSON='{"backup":{"timeout_secs":93600,"secret":"..."},"cleanarr":{"timeout_secs":7200,"outage_message":"Cleanarr job missed"}}'
+MONITOR_BACKUP_TIMEOUT_SECS=90000   # overrides MONITORS_JSON
+MONITOR_CLEANARR_RECOVERY_MESSAGE="Cleanarr is back"
+```
+
+- JSON fields: `timeout_secs`, `debounce_secs`, `outage_message`, `recovery_message`, `secret`. Precedence per field: defaults < `MONITORS_JSON` < `MONITOR_<NAME>_*`. Environment variables: `_TIMEOUT_SECS`, `_DEBOUNCE_SECS`, `_OUTAGE_MESSAGE`, `_RECOVERY_MESSAGE`, `_SECRET`. `poop` can be overridden the same way.
+- Names are case-insensitive and `-` equals `_` (`cleanarr-job` is `MONITOR_CLEANARR_JOB_*`). Allowed characters are letters, digits, `_` and `-`.
+- A monitor that does not set a timeout or debounce inherits `HEARTBEAT_TIMEOUT_SECS` / `DEBOUNCE_SECS`. Its default messages name the monitor.
+- Each request needs `Authorization: Bearer <secret>`: the monitor's own `secret` if set, otherwise `HEARTBEAT_SECRET`.
+- Unknown names return `404`; monitors are never created on demand. A wrong or missing secret returns `401`.
+- `/fail` does not touch the last-heartbeat time. The next successful ping on that monitor sends its recovery message. It returns `502` if no alert could be delivered. Every `/fail` call sends an alert; there is no debounce.
 
 ## Getting Started
 
@@ -103,15 +122,17 @@ Now, every time you push, lefthook will bump the minor version and amend your co
 | `NTFY_TOPIC` | unless Pushover is set | — | ntfy topic. Enables ntfy, including ntfy-only mode |
 | `NTFY_SERVER` | no | `https://ntfy.sh` | ntfy base URL, no trailing slash required |
 | `NTFY_TOKEN` | no | — | Optional ntfy bearer token |
-| `HEARTBEAT_SECRET` | yes | — | Shared secret required as `Authorization: Bearer <secret>` on `GET /heartbeat/poop` |
-| `HEARTBEAT_TIMEOUT_SECS` | no | `90` | Seconds without a heartbeat before outage alert |
+| `HEARTBEAT_SECRET` | yes | — | Default secret required as `Authorization: Bearer <secret>` on heartbeat routes (monitors may override with their own secret) |
+| `HEARTBEAT_TIMEOUT_SECS` | no | `90` | Seconds without a heartbeat before outage alert (`poop` monitor; default for the others) |
 | `CHECK_INTERVAL_SECS` | no | `10` | How often to check staleness |
 | `DEBOUNCE_SECS` | no | `300` | Minimum gap between repeat outage alerts. Does not reset measured downtime |
 | `OUTAGE_MESSAGE` | no | `❌ Poop Monitor is offline!` | Outage text (appended with measured downtime, e.g. `(down for 100s)`) |
 | `RECOVERY_MESSAGE` | no | `✅ Poop Monitor is back online!` | Text when heartbeats resume after an outage alert |
-| `PORT` | no | `3000` | HTTP port (`GET /healthz`, `GET /heartbeat/poop`) |
+| `MONITORS_JSON` | no | — | JSON object of extra monitors, see [Named monitors](#named-monitors) |
+| `MONITOR_<NAME>_TIMEOUT_SECS` / `_DEBOUNCE_SECS` / `_OUTAGE_MESSAGE` / `_RECOVERY_MESSAGE` / `_SECRET` | no | — | Per-monitor settings |
+| `PORT` | no | `3000` | HTTP port (`GET /healthz`, `/heartbeat/{name}`) |
 
-`GET /healthz` returns JSON: `status`, `uptime_secs`, `backends` (`pushover` and/or `ntfy`), and `last_heartbeat_secs_ago`. `GET /heartbeat/poop` requires the `Authorization: Bearer <HEARTBEAT_SECRET>` header; the process exits at startup if `HEARTBEAT_SECRET` is unset or blank.
+`GET /healthz` returns JSON: `status`, `uptime_secs`, `backends` (`pushover` and/or `ntfy`), `last_heartbeat_secs_ago` (the `poop` monitor's age, kept for compatibility), and `monitors`: `{name: {status, last_seen_secs_ago}}` where `status` is `ok` or `down` (an outage was alerted or the timeout has passed). Heartbeat routes require the `Authorization: Bearer <secret>` header; the process exits at startup if `HEARTBEAT_SECRET` is unset or blank.
 
 ### Tests
 ```bash
@@ -120,9 +141,9 @@ cargo build --release --locked
 bash scripts/smoke-entrypoint.sh target/release/notification-api
 ```
 
-Unit tests cover the outage/recovery state machine (recovery only after a prior outage alert, independent heartbeat and alert timestamps) and Pushover-only, ntfy-only, and combined delivery against synthetic endpoints. `GET /healthz` is exercised on the same application factory the binary serves.
+Unit tests cover the outage/recovery state machine (recovery only after a prior outage alert, independent heartbeat and alert timestamps) and Pushover-only, ntfy-only, and combined delivery against synthetic endpoints. `GET /healthz` is exercised on the same application factory the binary serves. Multi-monitor tests cover two monitors, per-monitor secrets, unknown-name 404, and the `/fail` path.
 
-`scripts/smoke-entrypoint.sh` starts the shipped binary (the file the Dockerfile copies) with synthetic configuration and a local fixture. It checks `/healthz`, `/heartbeat/poop`, Pushover-only, ntfy-only, and combined backend selection, startup failures, a refused send, and clean `SIGTERM` shutdown. CI runs that script on `target/release/notification-api`. The reusable pattern is `docs/smoke-test-pattern.md`. Other repositories track their own adoption.
+`scripts/smoke-entrypoint.sh` starts the shipped binary (the file the Dockerfile copies) with synthetic configuration and a local fixture. It checks `/healthz`, `/heartbeat/poop`, a second monitor with its own secret, unknown-name 404, `/fail` alerts and recovery, Pushover-only, ntfy-only, and combined backend selection, startup failures, a refused send, and clean `SIGTERM` shutdown. CI runs that script on `target/release/notification-api`. The reusable pattern is `docs/smoke-test-pattern.md`. Other repositories track their own adoption.
 
 ## Contributing
 Pull requests are welcome! For major changes, please open an issue first to discuss what you would like to change.
