@@ -611,18 +611,20 @@ expect_code 401 GET /heartbeat/poop "$BACKUP_SECRET_VALUE"
 expect_code 401 GET /heartbeat/backup
 expect_code 404 GET /heartbeat/unknown "$HEARTBEAT_SECRET_VALUE"
 expect_code 404 POST /heartbeat/unknown/fail "$HEARTBEAT_SECRET_VALUE"
-echo "ok two monitors, per-monitor secret, unknown name 404"
+# Unauthenticated callers cannot tell unknown names from configured ones.
+expect_code 401 GET /heartbeat/unknown
+expect_code 401 POST /heartbeat/unknown/fail
+expect_code 401 POST /heartbeat/unknown/fail "wrong-secret"
+echo "ok two monitors, per-monitor secret, unknown name 404 only when authenticated"
 
 curl -fsS --max-time 2 "http://127.0.0.1:${MULTI_PORT}/healthz" | python3 -c '
 import json, sys
 body = json.load(sys.stdin)
-monitors = body.get("monitors", {})
-if sorted(monitors) != ["backup", "cron", "poop"]:
-    sys.exit(f"monitors: {body}")
-for name, entry in monitors.items():
-    if entry.get("status") != "ok" or not isinstance(entry.get("last_seen_secs_ago"), int):
-        sys.exit(f"monitor {name}: {entry}")
-print("ok healthz monitors", json.dumps(monitors, separators=(",", ":")))
+if "monitors" in body or "backup" in json.dumps(body):
+    sys.exit(f"healthz leaks monitor names: {body}")
+if body.get("monitors_total") != 3 or body.get("monitors_down") != 0:
+    sys.exit(f"healthz monitor counts: {body}")
+print("ok healthz monitor counts", body["monitors_total"], body["monitors_down"])
 '
 if [[ -s "$FIXTURE_LOG" ]]; then
   dump_log "$FIXTURE_LOG"
@@ -635,9 +637,13 @@ if [[ -s "$FIXTURE_LOG" ]]; then
   die "rejected /fail sent a notification"
 fi
 # /fail alerts immediately: configured message, then a custom body.
-expect_code 200 GET /heartbeat/backup/fail "$BACKUP_SECRET_VALUE"
+expect_code 404 GET /heartbeat/backup/fail "$BACKUP_SECRET_VALUE"
+expect_code 200 POST /heartbeat/backup/fail "$BACKUP_SECRET_VALUE"
+# A repeat inside the debounce window is suppressed, not sent.
+expect_code 202 POST /heartbeat/backup/fail "$BACKUP_SECRET_VALUE" "suppressed_body"
+# The next success ping on that monitor recovers it and clears the window.
+expect_code 200 GET /heartbeat/backup "$BACKUP_SECRET_VALUE"
 expect_code 200 POST /heartbeat/backup/fail "$BACKUP_SECRET_VALUE" "pg_dump exited 2"
-# The next success ping on that monitor recovers it.
 expect_code 200 GET /heartbeat/backup "$BACKUP_SECRET_VALUE"
 
 python3 - "$FIXTURE_LOG" <<'PY'
@@ -652,7 +658,12 @@ with open(sys.argv[1], encoding="utf-8") as handle:
         if line:
             form = parse_qs(json.loads(line)["body"], keep_blank_values=True)
             messages.append(form.get("message", [""])[0])
-expected = ["BACKUP_FAIL_FIXTURE", "pg_dump exited 2", "BACKUP_RECOVERY_FIXTURE"]
+expected = [
+    "BACKUP_FAIL_FIXTURE",
+    "BACKUP_RECOVERY_FIXTURE",
+    "pg_dump exited 2",
+    "BACKUP_RECOVERY_FIXTURE",
+]
 if messages != expected:
     sys.exit(f"fail path messages {messages}, expected {expected}")
 print("ok fail signal and recovery", messages)

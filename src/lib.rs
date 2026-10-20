@@ -11,7 +11,7 @@
 mod monitor;
 mod monitors;
 
-use actix_web::{get, route, web, App, HttpResponse, HttpServer};
+use actix_web::{get, post, route, web, App, HttpResponse, HttpServer};
 use log::{info, warn};
 use monitor::{
     evaluate_check, evaluate_heartbeat, format_outage_message, CheckDecision, HeartbeatDecision,
@@ -339,16 +339,13 @@ pub struct HealthResponse {
     pub backends: Vec<String>,
     /// Age of the default (`poop`) monitor's last heartbeat; kept for compatibility.
     pub last_heartbeat_secs_ago: u64,
+    /// Number of configured monitors. Names are deliberately not exposed: the
+    /// endpoint is unauthenticated.
     #[serde(default)]
-    pub monitors: BTreeMap<String, MonitorHealth>,
-}
-
-/// Per-monitor entry in the `/healthz` response.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct MonitorHealth {
-    /// `ok`, or `down` when an outage was alerted or the timeout has passed.
-    pub status: String,
-    pub last_seen_secs_ago: u64,
+    pub monitors_total: usize,
+    /// Monitors that are `down`: an outage was alerted or the timeout has passed.
+    #[serde(default)]
+    pub monitors_down: usize,
 }
 
 /// Shared per-monitor state, keyed by canonical monitor name.
@@ -483,27 +480,22 @@ pub async fn healthz(
     watcher: web::Data<WatcherConfig>,
     monitors: web::Data<Monitors>,
 ) -> HttpResponse {
-    let mut entries = BTreeMap::new();
+    let mut last_heartbeat_secs_ago = 0;
+    let mut monitors_down = 0;
     if let Ok(states) = monitors.lock() {
         for (name, config) in &watcher.monitors {
             let Some(state) = states.get(name) else {
                 continue;
             };
             let age = state.last_seen.elapsed().as_secs();
-            let down = state.phase == Phase::Outage || age > config.timeout_secs;
-            entries.insert(
-                name.clone(),
-                MonitorHealth {
-                    status: if down { "down" } else { "ok" }.to_string(),
-                    last_seen_secs_ago: age,
-                },
-            );
+            if state.phase == Phase::Outage || age > config.timeout_secs {
+                monitors_down += 1;
+            }
+            if name == DEFAULT_MONITOR {
+                last_heartbeat_secs_ago = age;
+            }
         }
     }
-    let last_heartbeat_secs_ago = entries
-        .get(DEFAULT_MONITOR)
-        .map(|m| m.last_seen_secs_ago)
-        .unwrap_or(0);
 
     HttpResponse::Ok().json(HealthResponse {
         status: "ok".to_string(),
@@ -514,39 +506,42 @@ pub async fn healthz(
             .map(str::to_string)
             .collect(),
         last_heartbeat_secs_ago,
-        monitors: entries,
+        monitors_total: watcher.monitors.len(),
+        monitors_down,
     })
 }
 
 /// Longest `/fail` body used as the alert message, in characters.
 const MAX_FAIL_MESSAGE_CHARS: usize = 500;
 
-/// Resolve the path name to its configuration and check the bearer secret.
+/// Check the bearer secret, then resolve the path name to its configuration.
 ///
-/// Unknown names are 404 (no auto-provisioning); a wrong or missing secret is 401.
+/// Authentication comes first so an unauthenticated caller cannot tell
+/// configured names from unknown ones: a wrong or missing secret is always 401.
+/// Unknown names are 404 only for callers holding the default secret (no
+/// auto-provisioning).
 fn authorize<'a>(
     request: &actix_web::HttpRequest,
     watcher: &'a WatcherConfig,
     default_secret: &str,
     raw_name: &str,
 ) -> Result<(String, &'a MonitorConfig), HttpResponse> {
-    let Some((name, config)) = normalize_name(raw_name)
-        .and_then(|name| watcher.monitors.get(&name).map(|config| (name, config)))
-    else {
-        return Err(HttpResponse::NotFound().finish());
-    };
-    let secret = config.secret.as_deref().unwrap_or(default_secret);
+    let found = normalize_name(raw_name)
+        .and_then(|name| watcher.monitors.get(&name).map(|config| (name, config)));
+    let secret = found
+        .as_ref()
+        .and_then(|(_, config)| config.secret.as_deref())
+        .unwrap_or(default_secret);
     let authorized = request
         .headers()
         .get(actix_web::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .is_some_and(|token| bool::from(token.as_bytes().ct_eq(secret.as_bytes())));
-    if authorized {
-        Ok((name, config))
-    } else {
-        Err(HttpResponse::Unauthorized().finish())
+    if !authorized {
+        return Err(HttpResponse::Unauthorized().finish());
     }
+    found.ok_or_else(|| HttpResponse::NotFound().finish())
 }
 
 #[route("/heartbeat/{name}", method = "GET", method = "POST")]
@@ -607,8 +602,10 @@ async fn heartbeat(
 
 /// Explicit failure signal: fire the outage alert now, optionally with the
 /// request body as the message. `last_seen` is untouched, so the next real
-/// heartbeat recovers the monitor.
-#[route("/heartbeat/{name}/fail", method = "GET", method = "POST")]
+/// heartbeat recovers the monitor. POST only, so prefetchers cannot fire it.
+/// Repeat calls within the monitor's `debounce_secs` of the last outage alert
+/// are suppressed (202).
+#[post("/heartbeat/{name}/fail")]
 async fn heartbeat_fail(
     request: actix_web::HttpRequest,
     path: web::Path<String>,
@@ -634,10 +631,33 @@ async fn heartbeat_fail(
         supplied.chars().take(MAX_FAIL_MESSAGE_CHARS).collect()
     };
 
+    // Claim the debounce window under the lock so concurrent calls cannot all
+    // pass the check; a failed send restores the previous value.
+    let previous_alert = {
+        let mut states = monitors.lock().unwrap();
+        let Some(mon) = states.get_mut(&name) else {
+            return HttpResponse::NotFound().finish();
+        };
+        let previous = mon.last_alert;
+        if previous.is_some_and(|at| at.elapsed().as_secs() < config.debounce_secs) {
+            info!(
+                "[{name}] Failure signal suppressed: inside the {}s debounce window",
+                config.debounce_secs
+            );
+            return HttpResponse::Accepted().body("suppressed");
+        }
+        mon.last_alert = Some(Instant::now());
+        previous
+    };
+
     warn!("[{name}] Failure signal received; sending outage alert.");
     let sent = send_alert(client.get_ref(), cfg.get_ref(), &message).await;
     if let Some(mon) = monitors.lock().unwrap().get_mut(&name) {
-        mon.record_outage_result(sent);
+        if sent {
+            mon.record_outage_result(true);
+        } else {
+            mon.last_alert = previous_alert;
+        }
     }
     if sent {
         HttpResponse::Ok().body("OK")
@@ -2077,7 +2097,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn unknown_monitor_is_404_without_provisioning() {
+    async fn unknown_monitor_is_401_unauthenticated_and_404_when_authenticated() {
         let monitors = new_monitors(&two_monitor_watcher());
         let app = two_monitor_app!(sample_notify(None, None), Arc::clone(&monitors));
         for uri in [
@@ -2085,13 +2105,21 @@ mod tests {
             "/heartbeat/nope/fail",
             "/heartbeat/a%20b",
         ] {
-            for authed in [true, false] {
-                let mut req = aw_test::TestRequest::get().uri(uri);
-                if authed {
-                    req = req.insert_header(bearer("REPLACE_ME"));
+            // Authenticated with the default secret: 404, no provisioning.
+            let req = aw_test::TestRequest::post()
+                .uri(uri)
+                .insert_header(bearer("REPLACE_ME"))
+                .to_request();
+            let resp = aw_test::call_service(&app, req).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+            // Unauthenticated or wrong secret: 401, same as a configured name.
+            for header in [None, Some("wrong"), Some("backup-secret")] {
+                let mut req = aw_test::TestRequest::post().uri(uri);
+                if let Some(secret) = header {
+                    req = req.insert_header(bearer(secret));
                 }
                 let resp = aw_test::call_service(&app, req.to_request()).await;
-                assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+                assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{uri}");
             }
         }
         assert_eq!(monitors.lock().unwrap().len(), 2);
@@ -2115,8 +2143,14 @@ mod tests {
         let backup_global =
             aw_test::call_service(&app, status("/heartbeat/backup", Some("REPLACE_ME"))).await;
         assert_eq!(backup_global.status(), StatusCode::UNAUTHORIZED);
-        let fail_global =
-            aw_test::call_service(&app, status("/heartbeat/backup/fail", Some("REPLACE_ME"))).await;
+        let fail_global = aw_test::call_service(
+            &app,
+            aw_test::TestRequest::post()
+                .uri("/heartbeat/backup/fail")
+                .insert_header(bearer("REPLACE_ME"))
+                .to_request(),
+        )
+        .await;
         assert_eq!(fail_global.status(), StatusCode::UNAUTHORIZED);
         // ... and the monitor secret does not open poop.
         let poop_backup =
@@ -2155,18 +2189,13 @@ mod tests {
         )
         .await;
         let body: HealthResponse = aw_test::read_body_json(health).await;
-        assert_eq!(body.monitors.len(), 2);
-        assert!(body.monitors["backup"].last_seen_secs_ago < 5);
-        assert_eq!(body.monitors["backup"].status, "ok");
-        assert!(body.monitors["poop"].last_seen_secs_ago >= 49);
-        assert_eq!(
-            body.last_heartbeat_secs_ago,
-            body.monitors["poop"].last_seen_secs_ago
-        );
+        assert_eq!(body.monitors_total, 2);
+        assert_eq!(body.monitors_down, 0);
+        assert!(body.last_heartbeat_secs_ago >= 49, "poop's age is reported");
     }
 
     #[actix_web::test]
-    async fn healthz_marks_stale_and_failed_monitors_down() {
+    async fn healthz_counts_stale_and_failed_monitors_down() {
         let monitors = new_monitors(&two_monitor_watcher());
         {
             let mut states = monitors.lock().unwrap();
@@ -2184,12 +2213,11 @@ mod tests {
             aw_test::read_body_json::<HealthResponse, _>(resp).await
         };
         let body = read(&app).await;
-        assert_eq!(body.monitors["poop"].status, "down");
-        assert_eq!(body.monitors["backup"].status, "ok");
+        assert_eq!((body.monitors_total, body.monitors_down), (2, 1));
 
         monitors.lock().unwrap().get_mut("backup").unwrap().phase = Phase::Outage;
         let body = read(&app).await;
-        assert_eq!(body.monitors["backup"].status, "down");
+        assert_eq!(body.monitors_down, 2);
     }
 
     #[actix_web::test]
@@ -2208,14 +2236,19 @@ mod tests {
         // No body: the monitor's configured outage message, no downtime suffix.
         let resp = aw_test::call_service(
             &app,
-            aw_test::TestRequest::get()
+            aw_test::TestRequest::post()
                 .uri("/heartbeat/backup/fail")
                 .insert_header(bearer("backup-secret"))
                 .to_request(),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
-        // Body present (POST): used as the message.
+        // Let the debounce window lapse (backup: 300s), then send a body.
+        {
+            let mut states = monitors.lock().unwrap();
+            let mon = states.get_mut("backup").unwrap();
+            mon.last_alert = Some(Instant::now() - Duration::from_secs(301));
+        }
         let resp = aw_test::call_service(
             &app,
             aw_test::TestRequest::post()
@@ -2256,6 +2289,97 @@ mod tests {
         assert_eq!(hits.len(), 3);
         assert_eq!(hits[2].body, "BACKUP_UP");
         assert_eq!(monitors.lock().unwrap()["backup"].phase, Phase::Healthy);
+    }
+
+    #[actix_web::test]
+    async fn fail_signal_is_debounced_per_monitor_and_cleared_by_recovery() {
+        let mock = spawn_mock().await;
+        let notify = sample_notify(
+            None,
+            Some(sample_ntfy(
+                &format!("http://127.0.0.1:{}", mock.port),
+                "alerts",
+            )),
+        );
+        let monitors = new_monitors(&two_monitor_watcher());
+        let app = two_monitor_app!(notify, Arc::clone(&monitors));
+        let fail = |uri: &'static str, secret: &'static str| {
+            aw_test::TestRequest::post()
+                .uri(uri)
+                .insert_header(bearer(secret))
+                .set_payload("boom")
+                .to_request()
+        };
+
+        let first =
+            aw_test::call_service(&app, fail("/heartbeat/backup/fail", "backup-secret")).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        for _ in 0..3 {
+            let again =
+                aw_test::call_service(&app, fail("/heartbeat/backup/fail", "backup-secret")).await;
+            assert_eq!(again.status(), StatusCode::ACCEPTED);
+            assert_eq!(aw_test::read_body(again).await, "suppressed");
+        }
+        assert_eq!(hits_of(&mock).len(), 1, "repeats are not sent");
+
+        // Another monitor has its own window.
+        let other = aw_test::call_service(&app, fail("/heartbeat/poop/fail", "REPLACE_ME")).await;
+        assert_eq!(other.status(), StatusCode::OK);
+        assert_eq!(hits_of(&mock).len(), 2);
+
+        // Recovery clears the window: backup may alert again (plus the recovery message).
+        let up = aw_test::call_service(
+            &app,
+            aw_test::TestRequest::post()
+                .uri("/heartbeat/backup")
+                .insert_header(bearer("backup-secret"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(up.status(), StatusCode::OK);
+        let again =
+            aw_test::call_service(&app, fail("/heartbeat/backup/fail", "backup-secret")).await;
+        assert_eq!(again.status(), StatusCode::OK);
+        assert_eq!(hits_of(&mock).len(), 4);
+    }
+
+    #[actix_web::test]
+    async fn fail_signal_rejects_get() {
+        let mock = spawn_mock().await;
+        let notify = sample_notify(
+            None,
+            Some(sample_ntfy(
+                &format!("http://127.0.0.1:{}", mock.port),
+                "alerts",
+            )),
+        );
+        let monitors = new_monitors(&two_monitor_watcher());
+        let app = two_monitor_app!(notify, Arc::clone(&monitors));
+        let resp = aw_test::call_service(
+            &app,
+            aw_test::TestRequest::get()
+                .uri("/heartbeat/backup/fail")
+                .insert_header(bearer("backup-secret"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(hits_of(&mock).is_empty());
+        assert!(monitors.lock().unwrap()["backup"].last_alert.is_none());
+    }
+
+    #[actix_web::test]
+    async fn healthz_does_not_expose_monitor_names() {
+        let monitors = new_monitors(&two_monitor_watcher());
+        let app = two_monitor_app!(sample_notify(None, None), monitors);
+        let resp = aw_test::call_service(
+            &app,
+            aw_test::TestRequest::get().uri("/healthz").to_request(),
+        )
+        .await;
+        let raw = String::from_utf8(aw_test::read_body(resp).await.to_vec()).unwrap();
+        assert!(!raw.contains("backup"), "{raw}");
+        assert!(!raw.contains("poop"), "{raw}");
     }
 
     #[actix_web::test]
