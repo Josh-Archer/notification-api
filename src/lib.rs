@@ -1,7 +1,7 @@
 //! Heartbeat watcher with multi-channel notification backends.
 //!
 //! The binary in `main.rs` is a thin entrypoint over this module. `/healthz`,
-//! `/heartbeat/poop`, configuration, delivery, and the outage/recovery watcher
+//! `/heartbeat/{name}[/fail]`, configuration, delivery, and the outage/recovery watcher
 //! all live here so the shipped executable and the tests use one implementation.
 //!
 //! Outage and recovery keep the binary's state machine: last heartbeat and last
@@ -9,16 +9,21 @@
 //! enabled backend accepts the alert, and recovery fires only after that.
 
 mod monitor;
+mod monitors;
 
-use actix_web::{get, web, App, HttpResponse, HttpServer};
+use actix_web::{get, post, route, web, App, HttpResponse, HttpServer};
 use log::{info, warn};
 use monitor::{
     evaluate_check, evaluate_heartbeat, format_outage_message, CheckDecision, HeartbeatDecision,
 };
+pub use monitors::{normalize_name, MonitorConfig, DEFAULT_MONITOR};
+#[cfg(test)]
+use monitors::{DEFAULT_OUTAGE_MESSAGE, DEFAULT_RECOVERY_MESSAGE};
 use once_cell::sync::Lazy;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::{BTreeMap, HashMap},
     env,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -34,8 +39,6 @@ static STARTED_AT_UNIX: Lazy<u64> = Lazy::new(|| {
         .unwrap_or(0)
 });
 
-const DEFAULT_OUTAGE_MESSAGE: &str = "❌ Poop Monitor is offline!";
-const DEFAULT_RECOVERY_MESSAGE: &str = "✅ Poop Monitor is back online!";
 const DEFAULT_PUSHOVER_URL: &str = "https://api.pushover.net/1/messages.json";
 const DEFAULT_PUSHOVER_RETRY: u64 = 60;
 const DEFAULT_PUSHOVER_EXPIRE: u64 = 3600;
@@ -73,8 +76,6 @@ pub struct NtfyConfig {
 pub struct NotifyConfig {
     pub pushover: Option<PushoverConfig>,
     pub ntfy: Option<NtfyConfig>,
-    pub outage_message: String,
-    pub recovery_message: String,
 }
 
 fn env_non_empty(key: &str) -> Option<String> {
@@ -93,7 +94,6 @@ impl NotifyConfig {
     ///   `PUSHOVER_EXPIRE`, `PUSHOVER_SOUND`, `PUSHOVER_DEVICE`.
     /// - ntfy: `NTFY_TOPIC` (required to enable). Optional `NTFY_SERVER`
     ///   (default `https://ntfy.sh`) and `NTFY_TOKEN`.
-    /// - Copy: `OUTAGE_MESSAGE`, `RECOVERY_MESSAGE`.
     pub fn from_env() -> Result<Self, String> {
         let pushover = match (
             env_non_empty("PUSHOVER_TOKEN"),
@@ -171,14 +171,7 @@ impl NotifyConfig {
             );
         }
 
-        Ok(Self {
-            pushover,
-            ntfy,
-            outage_message: env_non_empty("OUTAGE_MESSAGE")
-                .unwrap_or_else(|| DEFAULT_OUTAGE_MESSAGE.to_string()),
-            recovery_message: env_non_empty("RECOVERY_MESSAGE")
-                .unwrap_or_else(|| DEFAULT_RECOVERY_MESSAGE.to_string()),
-        })
+        Ok(Self { pushover, ntfy })
     }
 
     /// Names of enabled backends (for health / logging).
@@ -194,33 +187,32 @@ impl NotifyConfig {
     }
 }
 
-/// Runtime tuning for the staleness checker.
+/// Runtime tuning for the staleness checker and the named monitors it watches.
 #[derive(Clone, Debug)]
 pub struct WatcherConfig {
-    pub timeout_secs: u64,
     pub check_interval_secs: u64,
-    pub debounce_secs: u64,
+    /// Canonical monitor name → settings. Always contains `poop`.
+    pub monitors: BTreeMap<String, MonitorConfig>,
 }
 
 impl WatcherConfig {
+    /// Load from the environment, panicking on malformed values like the
+    /// rest of startup configuration.
     pub fn from_env() -> Self {
-        let timeout_secs: u64 = env::var("HEARTBEAT_TIMEOUT_SECS")
-            .unwrap_or_else(|_| "90".into())
-            .parse()
-            .expect("HEARTBEAT_TIMEOUT_SECS must be a number");
+        Self::try_from_env().unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    /// Fallible variant of [`WatcherConfig::from_env`].
+    pub fn try_from_env() -> Result<Self, String> {
         let check_interval_secs: u64 = env::var("CHECK_INTERVAL_SECS")
             .unwrap_or_else(|_| "10".into())
             .parse()
-            .expect("CHECK_INTERVAL_SECS must be a number");
-        let debounce_secs: u64 = env::var("DEBOUNCE_SECS")
-            .unwrap_or_else(|_| "300".into())
-            .parse()
-            .expect("DEBOUNCE_SECS must be a number");
-        Self {
-            timeout_secs,
+            .map_err(|_| "CHECK_INTERVAL_SECS must be a number".to_string())?;
+        let vars: BTreeMap<String, String> = env::vars().collect();
+        Ok(Self {
             check_interval_secs,
-            debounce_secs,
-        }
+            monitors: monitors::load_monitors(&vars)?,
+        })
     }
 }
 
@@ -236,7 +228,7 @@ fn heartbeat_secret_from_env() -> Result<String, String> {
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| "HEARTBEAT_SECRET must be set to protect /heartbeat/poop".into())
+        .ok_or_else(|| "HEARTBEAT_SECRET must be set to protect the heartbeat routes".into())
 }
 
 /// POST one Pushover message. `true` only when the HTTP status is success.
@@ -345,7 +337,29 @@ pub struct HealthResponse {
     pub status: String,
     pub uptime_secs: u64,
     pub backends: Vec<String>,
+    /// Age of the default (`poop`) monitor's last heartbeat; kept for compatibility.
     pub last_heartbeat_secs_ago: u64,
+    /// Number of configured monitors. Names are deliberately not exposed: the
+    /// endpoint is unauthenticated.
+    #[serde(default)]
+    pub monitors_total: usize,
+    /// Monitors that are `down`: an outage was alerted or the timeout has passed.
+    #[serde(default)]
+    pub monitors_down: usize,
+}
+
+/// Shared per-monitor state, keyed by canonical monitor name.
+pub(crate) type Monitors = Mutex<HashMap<String, MonitorState>>;
+
+/// Fresh state for every configured monitor.
+pub(crate) fn new_monitors(watcher: &WatcherConfig) -> Arc<Monitors> {
+    Arc::new(Mutex::new(
+        watcher
+            .monitors
+            .keys()
+            .map(|name| (name.clone(), MonitorState::new()))
+            .collect(),
+    ))
 }
 
 fn uptime_secs() -> u64 {
@@ -463,12 +477,25 @@ impl MonitorState {
 #[get("/healthz")]
 pub async fn healthz(
     notify: web::Data<NotifyConfig>,
-    monitor: web::Data<Mutex<MonitorState>>,
+    watcher: web::Data<WatcherConfig>,
+    monitors: web::Data<Monitors>,
 ) -> HttpResponse {
-    let last_heartbeat_secs_ago = monitor
-        .lock()
-        .map(|last| last.last_seen.elapsed().as_secs())
-        .unwrap_or(0);
+    let mut last_heartbeat_secs_ago = 0;
+    let mut monitors_down = 0;
+    if let Ok(states) = monitors.lock() {
+        for (name, config) in &watcher.monitors {
+            let Some(state) = states.get(name) else {
+                continue;
+            };
+            let age = state.last_seen.elapsed().as_secs();
+            if state.phase == Phase::Outage || age > config.timeout_secs {
+                monitors_down += 1;
+            }
+            if name == DEFAULT_MONITOR {
+                last_heartbeat_secs_ago = age;
+            }
+        }
+    }
 
     HttpResponse::Ok().json(HealthResponse {
         status: "ok".to_string(),
@@ -479,18 +506,32 @@ pub async fn healthz(
             .map(str::to_string)
             .collect(),
         last_heartbeat_secs_ago,
+        monitors_total: watcher.monitors.len(),
+        monitors_down,
     })
 }
 
-#[get("/heartbeat/poop")]
-async fn heartbeat(
-    request: actix_web::HttpRequest,
-    client: web::Data<Client>,
-    cfg: web::Data<NotifyConfig>,
-    watcher: web::Data<WatcherConfig>,
-    monitor: web::Data<Mutex<MonitorState>>,
-    secret: web::Data<String>,
-) -> HttpResponse {
+/// Longest `/fail` body used as the alert message, in characters.
+const MAX_FAIL_MESSAGE_CHARS: usize = 500;
+
+/// Check the bearer secret, then resolve the path name to its configuration.
+///
+/// Authentication comes first so an unauthenticated caller cannot tell
+/// configured names from unknown ones: a wrong or missing secret is always 401.
+/// Unknown names are 404 only for callers holding the default secret (no
+/// auto-provisioning).
+fn authorize<'a>(
+    request: &actix_web::HttpRequest,
+    watcher: &'a WatcherConfig,
+    default_secret: &str,
+    raw_name: &str,
+) -> Result<(String, &'a MonitorConfig), HttpResponse> {
+    let found = normalize_name(raw_name)
+        .and_then(|name| watcher.monitors.get(&name).map(|config| (name, config)));
+    let secret = found
+        .as_ref()
+        .and_then(|(_, config)| config.secret.as_deref())
+        .unwrap_or(default_secret);
     let authorized = request
         .headers()
         .get(actix_web::http::header::AUTHORIZATION)
@@ -498,22 +539,42 @@ async fn heartbeat(
         .and_then(|value| value.strip_prefix("Bearer "))
         .is_some_and(|token| bool::from(token.as_bytes().ct_eq(secret.as_bytes())));
     if !authorized {
-        return HttpResponse::Unauthorized().finish();
+        return Err(HttpResponse::Unauthorized().finish());
     }
+    found.ok_or_else(|| HttpResponse::NotFound().finish())
+}
 
-    let (alert, recovery_message) = {
-        let mut mon = monitor.lock().unwrap();
+#[route("/heartbeat/{name}", method = "GET", method = "POST")]
+async fn heartbeat(
+    request: actix_web::HttpRequest,
+    path: web::Path<String>,
+    client: web::Data<Client>,
+    cfg: web::Data<NotifyConfig>,
+    watcher: web::Data<WatcherConfig>,
+    monitors: web::Data<Monitors>,
+    secret: web::Data<String>,
+) -> HttpResponse {
+    let (name, config) = match authorize(&request, &watcher, &secret, &path) {
+        Ok(found) => found,
+        Err(response) => return response,
+    };
+
+    let alert = {
+        let mut states = monitors.lock().unwrap();
+        let Some(mon) = states.get_mut(&name) else {
+            return HttpResponse::NotFound().finish();
+        };
         let now = Instant::now();
         let now_secs = mon.secs_since_epoch(now);
         let prev_secs = mon.secs_since_epoch(mon.last_seen);
         let in_outage = mon.phase == Phase::Outage;
-        let decision = evaluate_heartbeat(now_secs, prev_secs, in_outage, watcher.timeout_secs);
+        let decision = evaluate_heartbeat(now_secs, prev_secs, in_outage, config.timeout_secs);
         let alert = mon.record_heartbeat();
 
         match decision {
             HeartbeatDecision::Recorded => {
                 info!(
-                    "Heartbeat received at {:?}; phase={:?}",
+                    "[{name}] Heartbeat received at {:?}; phase={:?}",
                     mon.last_seen, mon.phase
                 );
             }
@@ -521,34 +582,103 @@ async fn heartbeat(
                 outage_duration_secs,
             } => {
                 info!(
-                    "Heartbeat received at {:?} — recovered after {}s without heartbeat; phase={:?}",
+                    "[{name}] Heartbeat received at {:?} — recovered after {}s without heartbeat; phase={:?}",
                     mon.last_seen, outage_duration_secs, mon.phase
                 );
             }
         }
-        (alert, cfg.recovery_message.clone())
+        alert
     };
 
     if alert == Alert::Recovery {
-        info!("Heartbeat resumed after outage; sending recovery alert.");
-        if !send_alert(client.get_ref(), cfg.get_ref(), &recovery_message).await {
-            warn!("Failed to send recovery alert");
+        info!("[{name}] Heartbeat resumed after outage; sending recovery alert.");
+        if !send_alert(client.get_ref(), cfg.get_ref(), &config.recovery_message).await {
+            warn!("[{name}] Failed to send recovery alert");
         }
     }
 
     HttpResponse::Ok().body("OK")
 }
 
+/// Explicit failure signal: fire the outage alert now, optionally with the
+/// request body as the message. `last_seen` is untouched, so the next real
+/// heartbeat recovers the monitor. POST only, so prefetchers cannot fire it.
+/// Repeat calls within the monitor's `debounce_secs` of the last outage alert
+/// are suppressed (202).
+#[post("/heartbeat/{name}/fail")]
+async fn heartbeat_fail(
+    request: actix_web::HttpRequest,
+    path: web::Path<String>,
+    body: web::Bytes,
+    client: web::Data<Client>,
+    cfg: web::Data<NotifyConfig>,
+    watcher: web::Data<WatcherConfig>,
+    monitors: web::Data<Monitors>,
+) -> HttpResponse {
+    let Some(secret) = request.app_data::<web::Data<String>>().cloned() else {
+        return HttpResponse::InternalServerError().finish();
+    };
+    let (name, config) = match authorize(&request, &watcher, &secret, &path) {
+        Ok(found) => found,
+        Err(response) => return response,
+    };
+
+    let supplied = String::from_utf8_lossy(&body);
+    let supplied = supplied.trim();
+    let message: String = if supplied.is_empty() {
+        config.outage_message.clone()
+    } else {
+        supplied.chars().take(MAX_FAIL_MESSAGE_CHARS).collect()
+    };
+
+    // Claim the debounce window under the lock so concurrent calls cannot all
+    // pass the check; a failed send restores the previous value.
+    let previous_alert = {
+        let mut states = monitors.lock().unwrap();
+        let Some(mon) = states.get_mut(&name) else {
+            return HttpResponse::NotFound().finish();
+        };
+        let previous = mon.last_alert;
+        if previous.is_some_and(|at| at.elapsed().as_secs() < config.debounce_secs) {
+            info!(
+                "[{name}] Failure signal suppressed: inside the {}s debounce window",
+                config.debounce_secs
+            );
+            return HttpResponse::Accepted().body("suppressed");
+        }
+        mon.last_alert = Some(Instant::now());
+        previous
+    };
+
+    warn!("[{name}] Failure signal received; sending outage alert.");
+    let sent = send_alert(client.get_ref(), cfg.get_ref(), &message).await;
+    if let Some(mon) = monitors.lock().unwrap().get_mut(&name) {
+        if sent {
+            mon.record_outage_result(true);
+        } else {
+            mon.last_alert = previous_alert;
+        }
+    }
+    if sent {
+        HttpResponse::Ok().body("OK")
+    } else {
+        warn!("[{name}] Failed to send failure alert");
+        HttpResponse::BadGateway().body("alert delivery failed")
+    }
+}
+
 /// Register the routes the shipped binary serves.
 pub fn configure_app(cfg: &mut web::ServiceConfig) {
-    cfg.service(healthz).service(heartbeat);
+    cfg.service(healthz)
+        .service(heartbeat_fail)
+        .service(heartbeat);
 }
 
 /// Application factory shared by [`run`] and the in-crate tests.
 pub(crate) fn create_app(
     notify: NotifyConfig,
     watcher: WatcherConfig,
-    monitor: Arc<Mutex<MonitorState>>,
+    monitors: Arc<Monitors>,
     client: Client,
     heartbeat_secret: String,
 ) -> App<
@@ -564,33 +694,48 @@ pub(crate) fn create_app(
     App::new()
         .app_data(web::Data::new(notify))
         .app_data(web::Data::new(watcher))
-        .app_data(web::Data::from(monitor))
+        .app_data(web::Data::from(monitors))
         .app_data(web::Data::new(client))
         .app_data(web::Data::new(heartbeat_secret))
         .configure(configure_app)
 }
 
-/// One staleness pass. Sleeping and the decision both live with the caller so
-/// tests can exercise delivery without waiting on the check interval.
+/// One staleness pass over every monitor. Sleeping and the decision both live
+/// with the caller so tests can exercise delivery without waiting on the check
+/// interval.
 async fn poll_staleness(
     notify: &NotifyConfig,
     watcher: &WatcherConfig,
-    monitor: &Mutex<MonitorState>,
+    monitors: &Monitors,
     client: &Client,
 ) {
-    let (decision, outage_message) = {
-        let mon = monitor.lock().unwrap();
+    for (name, config) in &watcher.monitors {
+        poll_monitor(name, config, notify, monitors, client).await;
+    }
+}
+
+async fn poll_monitor(
+    name: &str,
+    config: &MonitorConfig,
+    notify: &NotifyConfig,
+    monitors: &Monitors,
+    client: &Client,
+) {
+    let decision = {
+        let states = monitors.lock().unwrap();
+        let Some(mon) = states.get(name) else {
+            return;
+        };
         let now_secs = mon.now_secs();
         let last_hb = mon.secs_since_epoch(mon.last_seen);
         let last_alert = mon.last_alert.map(|instant| mon.secs_since_epoch(instant));
-        let decision = evaluate_check(
+        evaluate_check(
             now_secs,
             last_hb,
             last_alert,
-            watcher.timeout_secs,
-            watcher.debounce_secs,
-        );
-        (decision, notify.outage_message.clone())
+            config.timeout_secs,
+            config.debounce_secs,
+        )
     };
 
     match decision {
@@ -598,8 +743,8 @@ async fn poll_staleness(
             secs_since_heartbeat,
         } => {
             info!(
-                "Heartbeat fresh ({}s ago, timeout {}s)",
-                secs_since_heartbeat, watcher.timeout_secs
+                "[{name}] Heartbeat fresh ({}s ago, timeout {}s)",
+                secs_since_heartbeat, config.timeout_secs
             );
         }
         CheckDecision::StillDown {
@@ -608,28 +753,28 @@ async fn poll_staleness(
             secs_until_next_alert,
         } => {
             info!(
-                "Still down: no heartbeat for {}s; last alert {}s ago; next alert in {}s (debounce {}s)",
-                secs_since_heartbeat,
-                secs_since_alert,
-                secs_until_next_alert,
-                watcher.debounce_secs
+                "[{name}] Still down: no heartbeat for {}s; last alert {}s ago; next alert in {}s (debounce {}s)",
+                secs_since_heartbeat, secs_since_alert, secs_until_next_alert, config.debounce_secs
             );
         }
         CheckDecision::AlertOutage {
             secs_since_heartbeat,
         } => {
             warn!(
-                "No heartbeat for {}s (> {}s). Sending outage alert via {:?}.",
+                "[{name}] No heartbeat for {}s (> {}s). Sending outage alert via {:?}.",
                 secs_since_heartbeat,
-                watcher.timeout_secs,
+                config.timeout_secs,
                 notify.backend_names()
             );
-            let alert_msg = format_outage_message(&outage_message, secs_since_heartbeat);
+            let alert_msg = format_outage_message(&config.outage_message, secs_since_heartbeat);
             let sent = send_alert(client, notify, &alert_msg).await;
-            let mut mon = monitor.lock().unwrap();
-            mon.record_outage_result(sent);
+            if let Some(mon) = monitors.lock().unwrap().get_mut(name) {
+                mon.record_outage_result(sent);
+            }
             if !sent {
-                warn!("Failed to send outage alert; leaving monitor phase and last_seen unchanged");
+                warn!(
+                    "[{name}] Failed to send outage alert; leaving monitor phase and last_seen unchanged"
+                );
             }
         }
     }
@@ -638,13 +783,13 @@ async fn poll_staleness(
 fn spawn_staleness_watcher(
     notify: NotifyConfig,
     watcher: WatcherConfig,
-    monitor: Arc<Mutex<MonitorState>>,
+    monitors: Arc<Monitors>,
     client: Client,
 ) {
     spawn(async move {
         loop {
             time::sleep(Duration::from_secs(watcher.check_interval_secs)).await;
-            poll_staleness(&notify, &watcher, &monitor, &client).await;
+            poll_staleness(&notify, &watcher, &monitors, &client).await;
         }
     });
 }
@@ -654,16 +799,25 @@ fn spawn_staleness_watcher(
 /// This is the process the Dockerfile runs.
 pub async fn run(notify: NotifyConfig, watcher: WatcherConfig) -> std::io::Result<()> {
     let heartbeat_secret = heartbeat_secret_from_env().expect("invalid heartbeat configuration");
-    let monitor = Arc::new(Mutex::new(MonitorState::new()));
+    let monitors = new_monitors(&watcher);
     let client = Client::new();
     info!(
         "Notification backends: {}",
         notify.backend_names().join(", ")
     );
+    info!(
+        "Monitors: {}",
+        watcher
+            .monitors
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     spawn_staleness_watcher(
         notify.clone(),
         watcher.clone(),
-        Arc::clone(&monitor),
+        Arc::clone(&monitors),
         client.clone(),
     );
 
@@ -673,7 +827,7 @@ pub async fn run(notify: NotifyConfig, watcher: WatcherConfig) -> std::io::Resul
         create_app(
             notify.clone(),
             watcher.clone(),
-            Arc::clone(&monitor),
+            Arc::clone(&monitors),
             client.clone(),
             heartbeat_secret.clone(),
         )
@@ -736,15 +890,17 @@ mod tests {
         ] {
             std::env::remove_var(key);
         }
+        let extra: Vec<String> = std::env::vars()
+            .map(|(key, _)| key)
+            .filter(|key| key.starts_with("MONITOR_") || key == "MONITORS_JSON")
+            .collect();
+        for key in extra {
+            std::env::remove_var(key);
+        }
     }
 
     fn sample_notify(pushover: Option<PushoverConfig>, ntfy: Option<NtfyConfig>) -> NotifyConfig {
-        NotifyConfig {
-            pushover,
-            ntfy,
-            outage_message: DEFAULT_OUTAGE_MESSAGE.to_string(),
-            recovery_message: DEFAULT_RECOVERY_MESSAGE.to_string(),
-        }
+        NotifyConfig { pushover, ntfy }
     }
 
     fn sample_pushover(url: &str) -> PushoverConfig {
@@ -771,10 +927,23 @@ mod tests {
 
     fn sample_watcher() -> WatcherConfig {
         WatcherConfig {
-            timeout_secs: 90,
             check_interval_secs: 3600,
-            debounce_secs: 300,
+            monitors: BTreeMap::from([("poop".to_string(), sample_monitor(90, None))]),
         }
+    }
+
+    fn sample_monitor(timeout_secs: u64, secret: Option<&str>) -> MonitorConfig {
+        MonitorConfig {
+            timeout_secs,
+            debounce_secs: 300,
+            outage_message: DEFAULT_OUTAGE_MESSAGE.to_string(),
+            recovery_message: DEFAULT_RECOVERY_MESSAGE.to_string(),
+            secret: secret.map(str::to_string),
+        }
+    }
+
+    fn test_monitors() -> Arc<Monitors> {
+        new_monitors(&sample_watcher())
     }
 
     fn test_client() -> Client {
@@ -958,8 +1127,9 @@ mod tests {
 
         let cfg = NotifyConfig::from_env().expect("should load");
         assert_eq!(cfg.backend_names(), vec!["pushover", "ntfy"]);
-        assert_eq!(cfg.outage_message, "down");
-        assert_eq!(cfg.recovery_message, "up");
+        let watcher = WatcherConfig::from_env();
+        assert_eq!(watcher.monitors["poop"].outage_message, "down");
+        assert_eq!(watcher.monitors["poop"].recovery_message, "up");
         let pushover = cfg.pushover.expect("pushover enabled");
         assert_eq!(pushover.token, "REPLACE_ME");
         assert_eq!(pushover.user, "REPLACE_ME");
@@ -1090,8 +1260,15 @@ mod tests {
         assert_eq!(ntfy.server, DEFAULT_NTFY_SERVER);
         assert_eq!(ntfy.topic, "solo");
         assert_eq!(ntfy.token, None);
-        assert_eq!(cfg.outage_message, DEFAULT_OUTAGE_MESSAGE);
-        assert_eq!(cfg.recovery_message, DEFAULT_RECOVERY_MESSAGE);
+        let watcher = WatcherConfig::from_env();
+        assert_eq!(
+            watcher.monitors["poop"].outage_message,
+            DEFAULT_OUTAGE_MESSAGE
+        );
+        assert_eq!(
+            watcher.monitors["poop"].recovery_message,
+            DEFAULT_RECOVERY_MESSAGE
+        );
     }
 
     #[test]
@@ -1133,17 +1310,18 @@ mod tests {
         let _lock = env_lock();
         let _clean = EnvGuard::enter();
         let defaults = WatcherConfig::from_env();
-        assert_eq!(defaults.timeout_secs, 90);
+        assert_eq!(defaults.monitors.len(), 1);
+        assert_eq!(defaults.monitors["poop"].timeout_secs, 90);
         assert_eq!(defaults.check_interval_secs, 10);
-        assert_eq!(defaults.debounce_secs, 300);
+        assert_eq!(defaults.monitors["poop"].debounce_secs, 300);
 
         std::env::set_var("HEARTBEAT_TIMEOUT_SECS", "15");
         std::env::set_var("CHECK_INTERVAL_SECS", "2");
         std::env::set_var("DEBOUNCE_SECS", "40");
         let custom = WatcherConfig::from_env();
-        assert_eq!(custom.timeout_secs, 15);
+        assert_eq!(custom.monitors["poop"].timeout_secs, 15);
         assert_eq!(custom.check_interval_secs, 2);
-        assert_eq!(custom.debounce_secs, 40);
+        assert_eq!(custom.monitors["poop"].debounce_secs, 40);
     }
 
     #[test]
@@ -1597,13 +1775,14 @@ mod tests {
                 "solo",
             )),
         );
-        let monitor = Mutex::new(MonitorState::new());
+        let monitor = test_monitors();
         let age = Duration::from_secs(1000);
         {
-            let mut mon = monitor.lock().unwrap();
-            age_heartbeat(&mut mon, age);
+            let mut states = monitor.lock().unwrap();
+            let mon = states.get_mut("poop").unwrap();
+            age_heartbeat(mon, age);
         }
-        let seen_before = monitor.lock().unwrap().last_seen;
+        let seen_before = monitor.lock().unwrap()["poop"].last_seen;
 
         poll_staleness(&notify, &sample_watcher(), &monitor, &test_client()).await;
 
@@ -1615,7 +1794,8 @@ mod tests {
             (990..=1010).contains(&down_for),
             "measured downtime {down_for} must follow the last heartbeat, not the alert"
         );
-        let mon = monitor.lock().unwrap();
+        let states = monitor.lock().unwrap();
+        let mon = states.get("poop").unwrap();
         assert_eq!(mon.phase, Phase::Outage);
         assert_eq!(mon.last_seen, seen_before);
         assert!(mon.last_alert.is_some());
@@ -1629,10 +1809,11 @@ mod tests {
             Some(sample_pushover(&format!("{server}/pushover"))),
             Some(sample_ntfy(&server, "fail")),
         );
-        let monitor = Mutex::new(MonitorState::new());
+        let monitor = test_monitors();
         {
-            let mut mon = monitor.lock().unwrap();
-            age_heartbeat(&mut mon, Duration::from_secs(1000));
+            let mut states = monitor.lock().unwrap();
+            let mon = states.get_mut("poop").unwrap();
+            age_heartbeat(mon, Duration::from_secs(1000));
         }
 
         let watcher = sample_watcher();
@@ -1642,7 +1823,8 @@ mod tests {
 
         let hits = hits_of(&mock);
         assert_eq!(hits.len(), 4, "failed delivery retries on the next check");
-        let mon = monitor.lock().unwrap();
+        let states = monitor.lock().unwrap();
+        let mon = states.get("poop").unwrap();
         assert_eq!(mon.phase, Phase::Healthy);
         assert!(mon.last_alert.is_none());
         assert!(mon.last_seen.elapsed().as_secs() >= 990);
@@ -1658,10 +1840,11 @@ mod tests {
             ))),
             None,
         );
-        let monitor = Mutex::new(MonitorState::new());
+        let monitor = test_monitors();
         {
-            let mut mon = monitor.lock().unwrap();
-            age_heartbeat(&mut mon, Duration::from_secs(1000));
+            let mut states = monitor.lock().unwrap();
+            let mon = states.get_mut("poop").unwrap();
+            age_heartbeat(mon, Duration::from_secs(1000));
         }
         let watcher = sample_watcher();
         let client = test_client();
@@ -1674,7 +1857,8 @@ mod tests {
         );
 
         {
-            let mut mon = monitor.lock().unwrap();
+            let mut states = monitor.lock().unwrap();
+            let mon = states.get_mut("poop").unwrap();
             // Previous alert is old enough that debounce allows another send.
             // last_seen stays at the original heartbeat.
             mon.last_alert = Some(mon.epoch + Duration::from_secs(100));
@@ -1710,7 +1894,7 @@ mod tests {
         ];
 
         for (notify, backends) in cases {
-            let monitor = Arc::new(Mutex::new(MonitorState::new()));
+            let monitor = test_monitors();
             let app = shipped_app!(notify, Arc::clone(&monitor));
             let req = aw_test::TestRequest::get().uri("/healthz").to_request();
             let resp = aw_test::call_service(&app, req).await;
@@ -1724,10 +1908,11 @@ mod tests {
 
     #[actix_web::test]
     async fn heartbeat_and_healthz_share_last_seen_on_shipped_factory() {
-        let monitor = Arc::new(Mutex::new(MonitorState::new()));
+        let monitor = test_monitors();
         {
-            let mut mon = monitor.lock().unwrap();
-            age_heartbeat(&mut mon, Duration::from_secs(50));
+            let mut states = monitor.lock().unwrap();
+            let mon = states.get_mut("poop").unwrap();
+            age_heartbeat(mon, Duration::from_secs(50));
         }
         let app = shipped_app!(
             sample_notify(None, Some(sample_ntfy("http://127.0.0.1:9", "solo"))),
@@ -1761,7 +1946,7 @@ mod tests {
         .await;
         let fresh_body: HealthResponse = aw_test::read_body_json(fresh).await;
         assert!(fresh_body.last_heartbeat_secs_ago < 5);
-        assert_eq!(monitor.lock().unwrap().phase, Phase::Healthy);
+        assert_eq!(monitor.lock().unwrap()["poop"].phase, Phase::Healthy);
     }
 
     #[actix_web::test]
@@ -1772,14 +1957,15 @@ mod tests {
             Some(sample_pushover(&format!("{server}/pushover"))),
             Some(sample_ntfy(&server, "alerts")),
         );
-        let monitor = Arc::new(Mutex::new(MonitorState::new()));
+        let monitor = test_monitors();
         {
-            let mut mon = monitor.lock().unwrap();
-            age_heartbeat(&mut mon, Duration::from_secs(200));
+            let mut states = monitor.lock().unwrap();
+            let mon = states.get_mut("poop").unwrap();
+            age_heartbeat(mon, Duration::from_secs(200));
             mon.phase = Phase::Outage;
             mon.last_alert = Some(mon.epoch + Duration::from_secs(100));
         }
-        let last_seen = monitor.lock().unwrap().last_seen;
+        let last_seen = monitor.lock().unwrap()["poop"].last_seen;
         let app = shipped_app!(notify, Arc::clone(&monitor));
 
         for authorization in [None, Some("Bearer xxxxxxxxxx"), Some("Bearer short")] {
@@ -1791,7 +1977,8 @@ mod tests {
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         }
 
-        let mon = monitor.lock().unwrap();
+        let states = monitor.lock().unwrap();
+        let mon = states.get("poop").unwrap();
         assert_eq!(mon.last_seen, last_seen);
         assert_eq!(mon.phase, Phase::Outage);
         assert!(hits_of(&mock).is_empty());
@@ -1800,7 +1987,7 @@ mod tests {
     #[actix_web::test]
     async fn heartbeat_accepts_correct_secret() {
         let notify = sample_notify(None, None);
-        let monitor = Arc::new(Mutex::new(MonitorState::new()));
+        let monitor = test_monitors();
         let app = shipped_app!(notify, monitor, "trimmed-secret");
 
         let response = aw_test::call_service(
@@ -1826,10 +2013,11 @@ mod tests {
             Some(sample_pushover(&format!("{server}/pushover"))),
             Some(sample_ntfy(&server, "alerts")),
         );
-        let monitor = Arc::new(Mutex::new(MonitorState::new()));
+        let monitor = test_monitors();
         {
-            let mut mon = monitor.lock().unwrap();
-            age_heartbeat(&mut mon, Duration::from_secs(200));
+            let mut states = monitor.lock().unwrap();
+            let mon = states.get_mut("poop").unwrap();
+            age_heartbeat(mon, Duration::from_secs(200));
             mon.phase = Phase::Outage;
             mon.last_alert = Some(mon.epoch + Duration::from_secs(100));
         }
@@ -1855,7 +2043,8 @@ mod tests {
             );
         }
         {
-            let mon = monitor.lock().unwrap();
+            let states = monitor.lock().unwrap();
+            let mon = states.get("poop").unwrap();
             assert_eq!(mon.phase, Phase::Healthy);
             assert!(mon.last_alert.is_none());
         }
@@ -1874,5 +2063,395 @@ mod tests {
             2,
             "a second heartbeat must not send another recovery"
         );
+    }
+
+    // --- multiple named monitors ---
+
+    fn two_monitor_watcher() -> WatcherConfig {
+        let mut watcher = sample_watcher();
+        let mut backup = sample_monitor(3600, Some("backup-secret"));
+        backup.outage_message = "BACKUP_DOWN".into();
+        backup.recovery_message = "BACKUP_UP".into();
+        watcher.monitors.insert("backup".into(), backup);
+        watcher
+    }
+
+    macro_rules! two_monitor_app {
+        ($notify:expr, $monitors:expr) => {
+            aw_test::init_service(create_app(
+                $notify,
+                two_monitor_watcher(),
+                $monitors,
+                test_client(),
+                "REPLACE_ME".into(),
+            ))
+            .await
+        };
+    }
+
+    fn bearer(secret: &str) -> (actix_web::http::header::HeaderName, String) {
+        (
+            actix_web::http::header::AUTHORIZATION,
+            format!("Bearer {secret}"),
+        )
+    }
+
+    #[actix_web::test]
+    async fn unknown_monitor_is_401_unauthenticated_and_404_when_authenticated() {
+        let monitors = new_monitors(&two_monitor_watcher());
+        let app = two_monitor_app!(sample_notify(None, None), Arc::clone(&monitors));
+        for uri in [
+            "/heartbeat/nope",
+            "/heartbeat/nope/fail",
+            "/heartbeat/a%20b",
+        ] {
+            // Authenticated with the default secret: 404, no provisioning.
+            let req = aw_test::TestRequest::post()
+                .uri(uri)
+                .insert_header(bearer("REPLACE_ME"))
+                .to_request();
+            let resp = aw_test::call_service(&app, req).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+            // Unauthenticated or wrong secret: 401, same as a configured name.
+            for header in [None, Some("wrong"), Some("backup-secret")] {
+                let mut req = aw_test::TestRequest::post().uri(uri);
+                if let Some(secret) = header {
+                    req = req.insert_header(bearer(secret));
+                }
+                let resp = aw_test::call_service(&app, req.to_request()).await;
+                assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{uri}");
+            }
+        }
+        assert_eq!(monitors.lock().unwrap().len(), 2);
+    }
+
+    #[actix_web::test]
+    async fn per_monitor_secret_is_enforced_and_default_applies_otherwise() {
+        let monitors = new_monitors(&two_monitor_watcher());
+        let app = two_monitor_app!(sample_notify(None, None), monitors);
+        let status = |uri: &'static str, secret: Option<&'static str>| {
+            let mut req = aw_test::TestRequest::get().uri(uri);
+            if let Some(secret) = secret {
+                req = req.insert_header(bearer(secret));
+            }
+            req.to_request()
+        };
+        let backup_ok =
+            aw_test::call_service(&app, status("/heartbeat/backup", Some("backup-secret"))).await;
+        assert_eq!(backup_ok.status(), StatusCode::OK);
+        // The global secret does not open a monitor with its own secret ...
+        let backup_global =
+            aw_test::call_service(&app, status("/heartbeat/backup", Some("REPLACE_ME"))).await;
+        assert_eq!(backup_global.status(), StatusCode::UNAUTHORIZED);
+        let fail_global = aw_test::call_service(
+            &app,
+            aw_test::TestRequest::post()
+                .uri("/heartbeat/backup/fail")
+                .insert_header(bearer("REPLACE_ME"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(fail_global.status(), StatusCode::UNAUTHORIZED);
+        // ... and the monitor secret does not open poop.
+        let poop_backup =
+            aw_test::call_service(&app, status("/heartbeat/poop", Some("backup-secret"))).await;
+        assert_eq!(poop_backup.status(), StatusCode::UNAUTHORIZED);
+        let poop_ok =
+            aw_test::call_service(&app, status("/heartbeat/poop", Some("REPLACE_ME"))).await;
+        assert_eq!(poop_ok.status(), StatusCode::OK);
+        let none = aw_test::call_service(&app, status("/heartbeat/backup", None)).await;
+        assert_eq!(none.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[actix_web::test]
+    async fn monitors_are_independent_and_post_is_accepted() {
+        let monitors = new_monitors(&two_monitor_watcher());
+        {
+            let mut states = monitors.lock().unwrap();
+            age_heartbeat(states.get_mut("poop").unwrap(), Duration::from_secs(50));
+            age_heartbeat(states.get_mut("backup").unwrap(), Duration::from_secs(50));
+        }
+        let app = two_monitor_app!(sample_notify(None, None), Arc::clone(&monitors));
+
+        let resp = aw_test::call_service(
+            &app,
+            aw_test::TestRequest::post()
+                .uri("/heartbeat/backup")
+                .insert_header(bearer("backup-secret"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let health = aw_test::call_service(
+            &app,
+            aw_test::TestRequest::get().uri("/healthz").to_request(),
+        )
+        .await;
+        let body: HealthResponse = aw_test::read_body_json(health).await;
+        assert_eq!(body.monitors_total, 2);
+        assert_eq!(body.monitors_down, 0);
+        assert!(body.last_heartbeat_secs_ago >= 49, "poop's age is reported");
+    }
+
+    #[actix_web::test]
+    async fn healthz_counts_stale_and_failed_monitors_down() {
+        let monitors = new_monitors(&two_monitor_watcher());
+        {
+            let mut states = monitors.lock().unwrap();
+            // poop timeout is 90s, backup 3600s.
+            age_heartbeat(states.get_mut("poop").unwrap(), Duration::from_secs(200));
+            age_heartbeat(states.get_mut("backup").unwrap(), Duration::from_secs(200));
+        }
+        let app = two_monitor_app!(sample_notify(None, None), Arc::clone(&monitors));
+        let read = |app| async move {
+            let resp = aw_test::call_service(
+                app,
+                aw_test::TestRequest::get().uri("/healthz").to_request(),
+            )
+            .await;
+            aw_test::read_body_json::<HealthResponse, _>(resp).await
+        };
+        let body = read(&app).await;
+        assert_eq!((body.monitors_total, body.monitors_down), (2, 1));
+
+        monitors.lock().unwrap().get_mut("backup").unwrap().phase = Phase::Outage;
+        let body = read(&app).await;
+        assert_eq!(body.monitors_down, 2);
+    }
+
+    #[actix_web::test]
+    async fn fail_signal_alerts_immediately_with_body_or_configured_message() {
+        let mock = spawn_mock().await;
+        let notify = sample_notify(
+            None,
+            Some(sample_ntfy(
+                &format!("http://127.0.0.1:{}", mock.port),
+                "alerts",
+            )),
+        );
+        let monitors = new_monitors(&two_monitor_watcher());
+        let app = two_monitor_app!(notify, Arc::clone(&monitors));
+
+        // No body: the monitor's configured outage message, no downtime suffix.
+        let resp = aw_test::call_service(
+            &app,
+            aw_test::TestRequest::post()
+                .uri("/heartbeat/backup/fail")
+                .insert_header(bearer("backup-secret"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Let the debounce window lapse (backup: 300s), then send a body.
+        {
+            let mut states = monitors.lock().unwrap();
+            let mon = states.get_mut("backup").unwrap();
+            mon.last_alert = Some(Instant::now() - Duration::from_secs(301));
+        }
+        let resp = aw_test::call_service(
+            &app,
+            aw_test::TestRequest::post()
+                .uri("/heartbeat/backup/fail")
+                .insert_header(bearer("backup-secret"))
+                .set_payload("  pg_dump exited 2  ")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let hits = hits_of(&mock);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].body, "BACKUP_DOWN");
+        assert_eq!(hits[1].body, "pg_dump exited 2");
+        {
+            let states = monitors.lock().unwrap();
+            assert_eq!(states["backup"].phase, Phase::Outage);
+            assert!(states["backup"].last_alert.is_some());
+            assert_eq!(
+                states["poop"].phase,
+                Phase::Healthy,
+                "other monitors untouched"
+            );
+        }
+
+        // The next success ping recovers with that monitor's recovery message.
+        let resp = aw_test::call_service(
+            &app,
+            aw_test::TestRequest::get()
+                .uri("/heartbeat/backup")
+                .insert_header(bearer("backup-secret"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let hits = hits_of(&mock);
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[2].body, "BACKUP_UP");
+        assert_eq!(monitors.lock().unwrap()["backup"].phase, Phase::Healthy);
+    }
+
+    #[actix_web::test]
+    async fn fail_signal_is_debounced_per_monitor_and_cleared_by_recovery() {
+        let mock = spawn_mock().await;
+        let notify = sample_notify(
+            None,
+            Some(sample_ntfy(
+                &format!("http://127.0.0.1:{}", mock.port),
+                "alerts",
+            )),
+        );
+        let monitors = new_monitors(&two_monitor_watcher());
+        let app = two_monitor_app!(notify, Arc::clone(&monitors));
+        let fail = |uri: &'static str, secret: &'static str| {
+            aw_test::TestRequest::post()
+                .uri(uri)
+                .insert_header(bearer(secret))
+                .set_payload("boom")
+                .to_request()
+        };
+
+        let first =
+            aw_test::call_service(&app, fail("/heartbeat/backup/fail", "backup-secret")).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        for _ in 0..3 {
+            let again =
+                aw_test::call_service(&app, fail("/heartbeat/backup/fail", "backup-secret")).await;
+            assert_eq!(again.status(), StatusCode::ACCEPTED);
+            assert_eq!(aw_test::read_body(again).await, "suppressed");
+        }
+        assert_eq!(hits_of(&mock).len(), 1, "repeats are not sent");
+
+        // Another monitor has its own window.
+        let other = aw_test::call_service(&app, fail("/heartbeat/poop/fail", "REPLACE_ME")).await;
+        assert_eq!(other.status(), StatusCode::OK);
+        assert_eq!(hits_of(&mock).len(), 2);
+
+        // Recovery clears the window: backup may alert again (plus the recovery message).
+        let up = aw_test::call_service(
+            &app,
+            aw_test::TestRequest::post()
+                .uri("/heartbeat/backup")
+                .insert_header(bearer("backup-secret"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(up.status(), StatusCode::OK);
+        let again =
+            aw_test::call_service(&app, fail("/heartbeat/backup/fail", "backup-secret")).await;
+        assert_eq!(again.status(), StatusCode::OK);
+        assert_eq!(hits_of(&mock).len(), 4);
+    }
+
+    #[actix_web::test]
+    async fn fail_signal_rejects_get() {
+        let mock = spawn_mock().await;
+        let notify = sample_notify(
+            None,
+            Some(sample_ntfy(
+                &format!("http://127.0.0.1:{}", mock.port),
+                "alerts",
+            )),
+        );
+        let monitors = new_monitors(&two_monitor_watcher());
+        let app = two_monitor_app!(notify, Arc::clone(&monitors));
+        let resp = aw_test::call_service(
+            &app,
+            aw_test::TestRequest::get()
+                .uri("/heartbeat/backup/fail")
+                .insert_header(bearer("backup-secret"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(hits_of(&mock).is_empty());
+        assert!(monitors.lock().unwrap()["backup"].last_alert.is_none());
+    }
+
+    #[actix_web::test]
+    async fn healthz_does_not_expose_monitor_names() {
+        let monitors = new_monitors(&two_monitor_watcher());
+        let app = two_monitor_app!(sample_notify(None, None), monitors);
+        let resp = aw_test::call_service(
+            &app,
+            aw_test::TestRequest::get().uri("/healthz").to_request(),
+        )
+        .await;
+        let raw = String::from_utf8(aw_test::read_body(resp).await.to_vec()).unwrap();
+        assert!(!raw.contains("backup"), "{raw}");
+        assert!(!raw.contains("poop"), "{raw}");
+    }
+
+    #[actix_web::test]
+    async fn fail_signal_requires_secret_and_reports_delivery_failure() {
+        let mock = spawn_mock().await;
+        let server = format!("http://127.0.0.1:{}", mock.port);
+        let monitors = new_monitors(&two_monitor_watcher());
+        let app = two_monitor_app!(
+            sample_notify(None, Some(sample_ntfy(&server, "fail"))),
+            Arc::clone(&monitors)
+        );
+
+        let unauth = aw_test::call_service(
+            &app,
+            aw_test::TestRequest::post()
+                .uri("/heartbeat/poop/fail")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+        assert!(hits_of(&mock).is_empty());
+
+        // Backend rejects ("fail" in the topic path): 502, phase unchanged.
+        let failed = aw_test::call_service(
+            &app,
+            aw_test::TestRequest::post()
+                .uri("/heartbeat/poop/fail")
+                .insert_header(bearer("REPLACE_ME"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(failed.status(), StatusCode::BAD_GATEWAY);
+        let states = monitors.lock().unwrap();
+        assert_eq!(states["poop"].phase, Phase::Healthy);
+        assert!(states["poop"].last_alert.is_none());
+    }
+
+    #[actix_web::test]
+    async fn poll_uses_each_monitors_timeout_and_message() {
+        let mock = spawn_mock().await;
+        let notify = sample_notify(
+            None,
+            Some(sample_ntfy(
+                &format!("http://127.0.0.1:{}", mock.port),
+                "alerts",
+            )),
+        );
+        let watcher = two_monitor_watcher();
+        let monitors = new_monitors(&watcher);
+        {
+            let mut states = monitors.lock().unwrap();
+            // 200s old: past poop's 90s timeout, within backup's 3600s.
+            age_heartbeat(states.get_mut("poop").unwrap(), Duration::from_secs(200));
+            age_heartbeat(states.get_mut("backup").unwrap(), Duration::from_secs(200));
+        }
+        poll_staleness(&notify, &watcher, &monitors, &test_client()).await;
+        let hits = hits_of(&mock);
+        assert_eq!(hits.len(), 1);
+        assert!(decoded_body(&hits[0].body).contains("Poop Monitor is offline"));
+        {
+            let states = monitors.lock().unwrap();
+            assert_eq!(states["poop"].phase, Phase::Outage);
+            assert_eq!(states["backup"].phase, Phase::Healthy);
+        }
+
+        {
+            let mut states = monitors.lock().unwrap();
+            age_heartbeat(states.get_mut("backup").unwrap(), Duration::from_secs(4000));
+        }
+        poll_staleness(&notify, &watcher, &monitors, &test_client()).await;
+        let hits = hits_of(&mock);
+        assert_eq!(hits.len(), 2, "poop is debounced; backup alerts");
+        assert!(hits[1].body.starts_with("BACKUP_DOWN"));
     }
 }
