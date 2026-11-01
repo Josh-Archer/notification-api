@@ -1,21 +1,33 @@
 name: Build and Publish Docker Image
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 on:
   push:
     branches:
       - main
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE*"
   workflow_dispatch:
 
+# Queue (don't cancel) publishes so a version tag is never left half-pushed.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: notification-api
+
 jobs:
-  build-and-push:
+  prepare:
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'uecb-shared' }}
-    env:
-      PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
-      PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.cargo-version.outputs.version }}
+      image: ${{ steps.image.outputs.image }}
     steps:
       - name: Checkout code
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -26,27 +38,35 @@ jobs:
           VERSION=$(grep '^version =' Cargo.toml | head -n1 | sed 's/version = "//;s/"//')
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Tag commit with version (if not exists)
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Resolve image name
+        id: image
         run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          TAG="v${{ steps.cargo-version.outputs.version }}"
-          if git ls-remote --tags origin | grep -q "refs/tags/$TAG"; then
-            echo "Tag $TAG already exists on remote. Skipping tag creation and push."
-          else
-            git tag "$TAG"
-            git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}" "$TAG"
-          fi
+          OWNER_LC="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          echo "image=ghcr.io/${OWNER_LC}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+  # Native per-arch builds (no QEMU), pushed by digest with a per-arch GHA cache.
+  build:
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: uecb-shared
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      # Primary registry: works with GITHUB_TOKEN (no Docker Hub credentials required).
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
@@ -54,42 +74,90 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # GHCR is the sole supported publication registry.
-      - name: Resolve image tags
-        id: meta
-        env:
-          VERSION: ${{ steps.cargo-version.outputs.version }}
-        run: |
-          set -euo pipefail
-          OWNER_LC="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
-          GHCR_IMAGE="ghcr.io/${OWNER_LC}/notification-api"
-          TAGS="${GHCR_IMAGE}:${VERSION}"$'\n'"${GHCR_IMAGE}:latest"
-          {
-            echo "tags<<EOF"
-            printf '%s\n' "$TAGS"
-            echo "EOF"
-            echo "ghcr_image=${GHCR_IMAGE}"
-          } >> "$GITHUB_OUTPUT"
-          echo "Resolved GHCR tags:"
-          printf '%s\n' "$TAGS"
-
-      # Multi-stage Dockerfile builds the Rust binary inside the image for each platform.
-      - name: Build and push multi-arch Docker image
+      - name: Build and push by digest
+        id: build
         uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           context: .
-          push: true
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/${{ matrix.arch }}
           provenance: false
-          tags: ${{ steps.meta.outputs.tags }}
-          build-args: |
-            PUSHOVER_TOKEN=${{ secrets.PUSHOVER_TOKEN }}
-            PUSHOVER_USER=${{ secrets.PUSHOVER_USER }}
+          outputs: type=image,name=${{ needs.prepare.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ env.IMAGE_NAME }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ env.IMAGE_NAME }}-${{ matrix.arch }}
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/digests"
+          touch "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Publish tags and the git version tag only after every arch built.
+  publish:
+    needs: [prepare, build]
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'uecb-shared' }}
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: digest-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/digests
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifest
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2046
+          docker buildx imagetools create -t "${IMAGE}:${VERSION}" -t "${IMAGE}:latest" \
+            $(printf "${IMAGE}@sha256:%s " *)
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}"
+
+      - name: Tag commit with version (if not exists)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          TAG="v${VERSION}"
+          if git ls-remote --tags origin | grep -q "refs/tags/$TAG"; then
+            echo "Tag $TAG already exists on remote. Skipping tag creation and push."
+          else
+            git tag "$TAG"
+            git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}" "$TAG"
+          fi
 
       - name: Summarize publish target
         env:
-          VERSION: ${{ steps.cargo-version.outputs.version }}
-          GHCR_IMAGE: ${{ steps.meta.outputs.ghcr_image }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          GHCR_IMAGE: ${{ needs.prepare.outputs.image }}
         run: |
-          printf '### Publish summary\n- Version: %s\n- Platforms: linux/amd64,linux/arm64\n- Canonical registry: %s (GHCR only)\n' \
+          printf '### Publish summary\n- Version: %s\n- Platforms: linux/amd64,linux/arm64 (native)\n- Canonical registry: %s (GHCR only)\n' \
             "$VERSION" "$GHCR_IMAGE" >> "$GITHUB_STEP_SUMMARY"
