@@ -13,9 +13,6 @@ on:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
-    env:
-      PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
-      PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
     steps:
       - name: Checkout code
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -82,9 +79,6 @@ jobs:
           platforms: linux/amd64,linux/arm64
           provenance: false
           tags: ${{ steps.meta.outputs.tags }}
-          build-args: |
-            PUSHOVER_TOKEN=${{ secrets.PUSHOVER_TOKEN }}
-            PUSHOVER_USER=${{ secrets.PUSHOVER_USER }}
 
       - name: Summarize publish target
         env:
