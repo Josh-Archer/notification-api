@@ -24,6 +24,12 @@ The service exposes `GET|POST /heartbeat/{name}` for each configured monitor; `/
 
 Recovery fires **only** after a prior outage alert (not on ordinary heartbeats or startup). While still offline, outage alerts may repeat after `DEBOUNCE_SECS`.
 
+Monitor state (last heartbeat, last outage alert, and outage phase) is saved to
+`HEARTBEAT_STATE_PATH`, which defaults to `/data/heartbeat-state.json`. Mount
+persistent storage at `/data` in container deployments to retain outage timing
+across restarts. The file is replaced atomically; a missing or unreadable state
+file is logged and the service starts with fresh monitor state.
+
 ### Named monitors
 
 The `poop` monitor always exists and takes its settings from `HEARTBEAT_TIMEOUT_SECS`, `DEBOUNCE_SECS`, `OUTAGE_MESSAGE` and `RECOVERY_MESSAGE`, so existing deployments behave exactly as before. Add more monitors with `MONITORS_JSON` and/or `MONITOR_<NAME>_*` variables:
@@ -130,6 +136,7 @@ Now, every time you push, lefthook will bump the minor version and amend your co
 | `RECOVERY_MESSAGE` | no | `✅ Poop Monitor is back online!` | Text when heartbeats resume after an outage alert |
 | `MONITORS_JSON` | no | — | JSON object of extra monitors, see [Named monitors](#named-monitors) |
 | `MONITOR_<NAME>_TIMEOUT_SECS` / `_DEBOUNCE_SECS` / `_OUTAGE_MESSAGE` / `_RECOVERY_MESSAGE` / `_SECRET` | no | — | Per-monitor settings |
+| `HEARTBEAT_STATE_PATH` | no | `/data/heartbeat-state.json` | JSON file used to persist monitor state across restarts; mount its parent directory on persistent storage |
 | `PORT` | no | `3000` | HTTP port (`GET /healthz`, `/heartbeat/{name}`) |
 
 `GET /healthz` returns JSON: `status`, `uptime_secs`, `backends` (`pushover` and/or `ntfy`), `last_heartbeat_secs_ago` (the `poop` monitor's age, kept for compatibility), `monitors_total`, and `monitors_down` (monitors with an alerted outage or past their timeout). Monitor names are not listed because the endpoint is unauthenticated. Heartbeat routes require the `Authorization: Bearer <secret>` header; the process exits at startup if `HEARTBEAT_SECRET` is unset or blank.

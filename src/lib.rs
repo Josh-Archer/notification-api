@@ -25,6 +25,9 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
     env,
+    fs::{self, File, OpenOptions},
+    io::Write,
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -45,6 +48,7 @@ const DEFAULT_PUSHOVER_EXPIRE: u64 = 3600;
 const MAX_PUSHOVER_EXPIRE: u64 = 10800;
 const DEFAULT_NTFY_SERVER: &str = "https://ntfy.sh";
 const DEFAULT_PORT: u16 = 3000;
+const DEFAULT_STATE_PATH: &str = "/data/heartbeat-state.json";
 
 /// Pushover credentials and the messages endpoint (overridable for tests).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -193,6 +197,8 @@ pub struct WatcherConfig {
     pub check_interval_secs: u64,
     /// Canonical monitor name → settings. Always contains `poop`.
     pub monitors: BTreeMap<String, MonitorConfig>,
+    /// Optional durable state path. `None` is used by isolated in-process callers.
+    pub state_path: Option<PathBuf>,
 }
 
 impl WatcherConfig {
@@ -212,6 +218,11 @@ impl WatcherConfig {
         Ok(Self {
             check_interval_secs,
             monitors: monitors::load_monitors(&vars)?,
+            state_path: Some(
+                env_non_empty("HEARTBEAT_STATE_PATH")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_PATH)),
+            ),
         })
     }
 }
@@ -351,15 +362,128 @@ pub struct HealthResponse {
 /// Shared per-monitor state, keyed by canonical monitor name.
 pub(crate) type Monitors = Mutex<HashMap<String, MonitorState>>;
 
-/// Fresh state for every configured monitor.
+/// Restore persisted state for configured monitors; unrecognized names are ignored.
 pub(crate) fn new_monitors(watcher: &WatcherConfig) -> Arc<Monitors> {
-    Arc::new(Mutex::new(
-        watcher
-            .monitors
-            .keys()
-            .map(|name| (name.clone(), MonitorState::new()))
-            .collect(),
-    ))
+    let mut states: HashMap<String, MonitorState> = watcher
+        .monitors
+        .keys()
+        .map(|name| (name.clone(), MonitorState::new()))
+        .collect();
+    if let Some(path) = &watcher.state_path {
+        match fs::read(path) {
+            Ok(bytes) => match serde_json::from_slice::<PersistedState>(&bytes) {
+                Ok(saved) => {
+                    for (name, state) in saved.monitors {
+                        if watcher.monitors.contains_key(&name) {
+                            states.insert(name, MonitorState::restore(state));
+                        }
+                    }
+                }
+                Err(err) => warn!(
+                    "Could not read heartbeat state at {}: {err}; starting fresh",
+                    path.display()
+                ),
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                info!("No heartbeat state at {}; starting fresh", path.display());
+            }
+            Err(err) => warn!(
+                "Could not read heartbeat state at {}: {err}; starting fresh",
+                path.display()
+            ),
+        }
+    }
+    // Establish a durable initial heartbeat time too, so repeated restarts
+    // without an incoming ping do not keep resetting the outage clock.
+    persist_monitors(watcher, &states);
+    Arc::new(Mutex::new(states))
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedState {
+    monitors: HashMap<String, PersistedMonitor>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedMonitor {
+    last_seen_unix_secs: u64,
+    last_alert_unix_secs: Option<u64>,
+    phase: Phase,
+}
+
+fn unix_secs_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn persist_monitors(watcher: &WatcherConfig, states: &HashMap<String, MonitorState>) {
+    persist_monitors_to(watcher.state_path.as_deref(), states);
+}
+
+fn persist_monitors_to(path: Option<&std::path::Path>, states: &HashMap<String, MonitorState>) {
+    let Some(path) = path else {
+        return;
+    };
+    let now = Instant::now();
+    let wall_now = unix_secs_now();
+    let monitors = states
+        .iter()
+        .map(|(name, state)| {
+            let age = now.saturating_duration_since(state.last_seen).as_secs();
+            let alert_age = state
+                .last_alert
+                .map(|at| now.saturating_duration_since(at).as_secs());
+            (
+                name.clone(),
+                PersistedMonitor {
+                    last_seen_unix_secs: wall_now.saturating_sub(age),
+                    last_alert_unix_secs: alert_age.map(|age| wall_now.saturating_sub(age)),
+                    phase: state.phase,
+                },
+            )
+        })
+        .collect();
+    let serialized = match serde_json::to_vec(&PersistedState { monitors }) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            warn!("Could not serialize heartbeat state: {err}");
+            return;
+        }
+    };
+    if let Err(err) = write_state_atomically(path, &serialized) {
+        warn!(
+            "Could not persist heartbeat state at {}: {err}",
+            path.display()
+        );
+    }
+}
+
+fn write_state_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    if let Some(parent) = parent {
+        fs::create_dir_all(parent)?;
+    }
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+    let temp_path = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&temp_path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&temp_path, path)?;
+    if let Some(parent) = parent {
+        if let Ok(dir) = File::open(parent) {
+            dir.sync_all()?;
+        }
+    }
+    Ok(())
 }
 
 fn uptime_secs() -> u64 {
@@ -371,7 +495,8 @@ fn uptime_secs() -> u64 {
 }
 
 /// Monitor lifecycle phase for outage / recovery alerting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum Phase {
     /// Heartbeats are flowing (or startup before any outage alert).
     Healthy,
@@ -430,6 +555,26 @@ impl MonitorState {
             last_alert: None,
             phase: Phase::Healthy,
             epoch,
+        }
+    }
+
+    fn restore(saved: PersistedMonitor) -> Self {
+        let now = Instant::now();
+        let now_unix = unix_secs_now();
+        let seen_age = now_unix.saturating_sub(saved.last_seen_unix_secs);
+        let alert_age = saved
+            .last_alert_unix_secs
+            .map(|at| now_unix.saturating_sub(at));
+        let last_seen = now
+            .checked_sub(Duration::from_secs(seen_age))
+            .unwrap_or(now);
+        Self {
+            last_seen,
+            last_alert: alert_age.and_then(|age| now.checked_sub(Duration::from_secs(age))),
+            phase: saved.phase,
+            // Anchor the process-relative clock at the restored heartbeat so
+            // elapsed durations include time from before this process started.
+            epoch: last_seen,
         }
     }
 
@@ -587,6 +732,7 @@ async fn heartbeat(
                 );
             }
         }
+        persist_monitors(&watcher, &states);
         alert
     };
 
@@ -652,12 +798,16 @@ async fn heartbeat_fail(
 
     warn!("[{name}] Failure signal received; sending outage alert.");
     let sent = send_alert(client.get_ref(), cfg.get_ref(), &message).await;
-    if let Some(mon) = monitors.lock().unwrap().get_mut(&name) {
-        if sent {
-            mon.record_outage_result(true);
-        } else {
-            mon.last_alert = previous_alert;
+    {
+        let mut states = monitors.lock().unwrap();
+        if let Some(mon) = states.get_mut(&name) {
+            if sent {
+                mon.record_outage_result(true);
+            } else {
+                mon.last_alert = previous_alert;
+            }
         }
+        persist_monitors(&watcher, &states);
     }
     if sent {
         HttpResponse::Ok().body("OK")
@@ -710,7 +860,15 @@ async fn poll_staleness(
     client: &Client,
 ) {
     for (name, config) in &watcher.monitors {
-        poll_monitor(name, config, notify, monitors, client).await;
+        poll_monitor(
+            name,
+            config,
+            notify,
+            watcher.state_path.as_deref(),
+            monitors,
+            client,
+        )
+        .await;
     }
 }
 
@@ -718,6 +876,7 @@ async fn poll_monitor(
     name: &str,
     config: &MonitorConfig,
     notify: &NotifyConfig,
+    state_path: Option<&std::path::Path>,
     monitors: &Monitors,
     client: &Client,
 ) {
@@ -768,9 +927,11 @@ async fn poll_monitor(
             );
             let alert_msg = format_outage_message(&config.outage_message, secs_since_heartbeat);
             let sent = send_alert(client, notify, &alert_msg).await;
-            if let Some(mon) = monitors.lock().unwrap().get_mut(name) {
+            let mut states = monitors.lock().unwrap();
+            if let Some(mon) = states.get_mut(name) {
                 mon.record_outage_result(sent);
             }
+            persist_monitors_to(state_path, &states);
             if !sent {
                 warn!(
                     "[{name}] Failed to send outage alert; leaving monitor phase and last_seen unchanged"
@@ -929,6 +1090,7 @@ mod tests {
         WatcherConfig {
             check_interval_secs: 3600,
             monitors: BTreeMap::from([("poop".to_string(), sample_monitor(90, None))]),
+            state_path: None,
         }
     }
 
@@ -944,6 +1106,70 @@ mod tests {
 
     fn test_monitors() -> Arc<Monitors> {
         new_monitors(&sample_watcher())
+    }
+
+    fn temp_state_path(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        env::temp_dir().join(format!(
+            "notification-api-{label}-{}-{unique}.json",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn monitor_state_survives_restart_and_preserves_outage_duration() {
+        let path = temp_state_path("restart");
+        let mut watcher = sample_watcher();
+        watcher.state_path = Some(path.clone());
+        let first_run = new_monitors(&watcher);
+        {
+            let mut states = first_run.lock().unwrap();
+            let state = states.get_mut("poop").unwrap();
+            state.last_seen = Instant::now() - Duration::from_secs(125);
+            state.phase = Phase::Outage;
+            state.last_alert = Some(Instant::now() - Duration::from_secs(20));
+            persist_monitors(&watcher, &states);
+        }
+
+        let restarted = new_monitors(&watcher);
+        let states = restarted.lock().unwrap();
+        let restored = states.get("poop").unwrap();
+        assert_eq!(restored.phase, Phase::Outage);
+        assert!((120..=126).contains(&restored.last_seen.elapsed().as_secs()));
+        assert!((15..=21).contains(&restored.last_alert.unwrap().elapsed().as_secs()));
+        let decision = evaluate_heartbeat(
+            restored.now_secs(),
+            restored.secs_since_epoch(restored.last_seen),
+            restored.phase == Phase::Outage,
+            90,
+        );
+        match decision {
+            HeartbeatDecision::Recovered {
+                outage_duration_secs,
+            } => {
+                assert!((120..=126).contains(&outage_duration_secs));
+            }
+            other => panic!("expected recovery with original outage duration, got {other:?}"),
+        }
+        drop(states);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn corrupt_state_file_starts_fresh() {
+        let path = temp_state_path("corrupt");
+        fs::write(&path, b"not json").unwrap();
+        let mut watcher = sample_watcher();
+        watcher.state_path = Some(path.clone());
+        let monitors = new_monitors(&watcher);
+        let states = monitors.lock().unwrap();
+        assert_eq!(states["poop"].phase, Phase::Healthy);
+        assert!(states["poop"].last_alert.is_none());
+        drop(states);
+        let _ = fs::remove_file(path);
     }
 
     fn test_client() -> Client {

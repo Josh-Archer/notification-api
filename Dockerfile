@@ -40,7 +40,7 @@ COPY .env .
 EXPOSE 3000
 
 # Optional: Create config and logs dirs
-RUN mkdir /config /logs
+RUN mkdir /config /logs /data
 
 # Set default command
 CMD ["./notification-api"]
