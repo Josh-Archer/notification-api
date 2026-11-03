@@ -23,7 +23,7 @@ env:
 
 jobs:
   prepare:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'uecb-shared' }}
     timeout-minutes: 5
     outputs:
       version: ${{ steps.cargo-version.outputs.version }}
@@ -57,7 +57,7 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: ubuntu-latest
+            runner: uecb-shared
           - arch: arm64
             runner: ubuntu-24.04-arm
     steps:
@@ -102,7 +102,7 @@ jobs:
   # Publish tags and the git version tag only after every arch built.
   publish:
     needs: [prepare, build]
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'uecb-shared' }}
     timeout-minutes: 10
     permissions:
       contents: write
