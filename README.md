@@ -18,8 +18,8 @@ The service exposes `GET|POST /heartbeat/{name}` for each configured monitor; `/
 
 | Event | Condition | Notification |
 |-------|-----------|--------------|
-| **Outage** | No heartbeat for longer than the monitor's timeout (`HEARTBEAT_TIMEOUT_SECS` for `poop`) |
-| **Outage (explicit)** | `POST /heartbeat/{name}/fail` | The request body if non-empty (trimmed, max 500 chars), otherwise the monitor's outage message, sent immediately | `OUTAGE_MESSAGE` (with measured downtime, e.g. `(down for 100s)`) on every enabled backend |
+| **Outage** | No heartbeat for longer than the monitor's timeout (`HEARTBEAT_TIMEOUT_SECS` for `poop`) | `OUTAGE_MESSAGE` (with measured downtime, e.g. `(down for 100s)`) on every enabled backend |
+| **Outage (explicit)** | `POST /heartbeat/{name}/fail` | The request body if non-empty (trimmed, max 500 chars), otherwise the monitor's outage message, sent immediately |
 | **Recovery** | First heartbeat after an outage alert was sent | `RECOVERY_MESSAGE` on every enabled backend |
 
 Recovery fires **only** after a prior outage alert (not on ordinary heartbeats or startup). While still offline, outage alerts may repeat after `DEBOUNCE_SECS`.
