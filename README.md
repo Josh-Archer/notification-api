@@ -2,6 +2,12 @@
 
 A Rust-based notification API with Docker deployment and automated versioning.
 
+## Status
+
+This repository is a standalone heartbeat tool and is **not deployed in [`Josh-Archer/home`](https://github.com/Josh-Archer/home)** (see [notification-api#37](https://github.com/Josh-Archer/notification-api/issues/37) and [home#3702](https://github.com/Josh-Archer/home/issues/3702)).
+
+It overlaps with `ntfy-pushover-forwarder` and Uptime Kuma, which remain the home alert path (`senders → ntfy → ntfy-pushover-forwarder`, with Uptime Kuma for uptime checks).
+
 ## Features
 - Written in Rust using Actix Web
 - Sends notifications via Pushover, ntfy, or both
